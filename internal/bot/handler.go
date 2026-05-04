@@ -32,20 +32,27 @@ func New(api *tgbotapi.BotAPI, mgr *Manager, publicURL string, ctx context.Conte
 	}
 }
 
+// shortcutSpec — slash komanda spetsifikatsiyasi.
+type shortcutSpec struct {
+	cmd  string
+	live bool // true bo'lsa — bitta xabarni davriy yangilab turadi (auto-update)
+}
+
 // shellShortcuts — slash komanda → aktiv sessiyada ishlatiladigan shell buyrug'i.
-// Hammasi NON-INTERACTIVE (TUI emas) — Telegram chat sharoitida snapshot beradi.
-var shellShortcuts = map[string]string{
-	"uptime": "uptime",
-	"disk":   "df -h",
-	"df":     "df -h",
-	"free":   "free -h",
-	"mem":    "free -h",
-	"ps":     "ps auxf | head -30",
-	"htop":   "top -bn1 -o %MEM | head -30",
-	"top":    "top -bn1 -o %MEM | head -30",
-	"who":    "who",
-	"ip":     "ip -br a",
-	"date":   "date",
+// Hammasi NON-INTERACTIVE — Telegram chat sharoitida snapshot beradi.
+// `live: true` — har 2 sekundda yangilanadigan jonli xabar (Stop tugmasi bilan).
+var shellShortcuts = map[string]shortcutSpec{
+	"htop":   {"top -bn1 -o %MEM | head -30", true},
+	"top":    {"top -bn1 -o %MEM | head -30", true},
+	"free":   {"free -h", true},
+	"mem":    {"free -h", true},
+	"uptime": {"uptime", true},
+	"disk":   {"df -h", false},
+	"df":     {"df -h", false},
+	"ps":     {"ps auxf | head -30", false},
+	"who":    {"who", false},
+	"ip":     {"ip -br a", false},
+	"date":   {"date", false},
 }
 
 // BotCommands Telegram'ning slash menyusiga registratsiya qilinadigan komandalar.
@@ -109,8 +116,8 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 	if m.IsCommand() {
 		cmd := m.Command()
 		// Shell shortcut'lar — aktiv sessiyada mos shell buyrug'ini bajaradi
-		if shellCmd, ok := shellShortcuts[cmd]; ok {
-			b.runShortcut(m, shellCmd)
+		if spec, ok := shellShortcuts[cmd]; ok {
+			b.runShortcut(m, spec)
 			return
 		}
 		switch cmd {
@@ -169,13 +176,19 @@ func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 	}
 	data := cb.Data
 
-	if strings.HasPrefix(data, "connect:") {
+	switch {
+	case strings.HasPrefix(data, "connect:"):
 		idStr := strings.TrimPrefix(data, "connect:")
 		serverID, err := strconv.ParseUint(idStr, 10, 64)
 		if err != nil {
 			return
 		}
 		b.connectByID(cb.From.ID, cb.Message.Chat.ID, uint(serverID))
+
+	case data == "live:stop":
+		if sess := b.Mgr.Get(cb.From.ID); sess != nil {
+			sess.StopLive()
+		}
 	}
 }
 
@@ -214,13 +227,17 @@ func (b *Bot) cmdHelp(m *tgbotapi.Message) {
 /disconnect — sessiyani yopish
 
 <b>Tezkor shell snapshotlar (aktiv sessiya kerak):</b>
-/uptime — uptime
-/disk yoki /df — df -h
+🔴 <i>Live (auto-update har 2 sek, max 3 daq)</i>:
+/htop yoki /top — top -bn1
 /free yoki /mem — free -h
+/uptime — uptime
+
+📸 <i>Bir martalik snapshot</i>:
+/disk yoki /df — df -h
 /ps — ps auxf | head -30
-/htop yoki /top — top -bn1 | head -30
 /who — kirgan foydalanuvchilar
 /ip — IP manzillar
+/date — joriy vaqt
 
 <b>Boshqa:</b>
 /raw &lt;hex&gt; — xom baytlar (masalan "1b5b41" = ↑)
@@ -324,13 +341,18 @@ func (b *Bot) cmdRaw(m *tgbotapi.Message) {
 }
 
 // runShortcut shortcut'ni aktiv sessiyada bajaradi.
-func (b *Bot) runShortcut(m *tgbotapi.Message, shellCmd string) {
+// spec.live=true bo'lsa — auto-update'li jonli xabar; aks holda one-shot snapshot.
+func (b *Bot) runShortcut(m *tgbotapi.Message, spec shortcutSpec) {
 	sess := b.Mgr.Get(m.From.ID)
 	if sess == nil {
 		b.reply(m.Chat.ID, "Aktiv sessiya yo'q. /servers ro'yxatdan tanlang.")
 		return
 	}
-	go sess.RunCommand(shellCmd)
+	if spec.live {
+		go sess.StartLive(m.Chat.ID, spec.cmd)
+	} else {
+		go sess.RunCommand(spec.cmd)
+	}
 }
 
 // --- Yordamchi ---

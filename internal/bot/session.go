@@ -25,6 +25,9 @@ const (
 	cmdMaxWait     = 15 * time.Second       // bitta komandaga maksimum kutish
 	idleDefault    = 30 * time.Minute
 	maxMsgChars    = 3800 // Telegram 4096 limit minus <pre>...</pre> tag joyi
+
+	liveInterval = 2 * time.Second // har necha sekundda live xabar yangilanadi
+	liveMaxTicks = 90              // ~3 daqiqa
 )
 
 // Session — bir Telegram foydalanuvchisining ulangan SSH sessiyasi.
@@ -46,6 +49,10 @@ type Session struct {
 
 	cmdMu sync.Mutex // bir vaqtda bitta komanda
 	mu    sync.Mutex
+
+	// Live shortcut state (faqat bitta aktiv bo'la oladi)
+	liveStop chan struct{} // close qilinsa goroutine to'xtaydi
+	liveMsg  int           // hozir tahrirlanayotgan xabar IDsi
 }
 
 type Manager struct {
@@ -129,6 +136,11 @@ func (s *Session) Close(reason string) {
 	}
 	s.closed = true
 	close(s.closeSig)
+	// Aktiv live task'ni ham to'xtatamiz
+	if s.liveStop != nil {
+		close(s.liveStop)
+		s.liveStop = nil
+	}
 	s.mu.Unlock()
 
 	if s.Conn != nil {
@@ -372,6 +384,128 @@ func (s *Session) idleWatchdog(m *Manager) {
 			}
 		}
 	}
+}
+
+// runOnceLocked cmdMu ostida bitta komandani bajarib outputni qaytaradi (live ticker uchun).
+func (s *Session) runOnceLocked(shellCmd string) ([]byte, bool) {
+	s.cmdMu.Lock()
+	defer s.cmdMu.Unlock()
+
+	if !s.markActive() {
+		return nil, false
+	}
+
+	s.drainAvailable()
+	if _, err := io.WriteString(s.Conn.Stdin, shellCmd+"\n"); err != nil {
+		return nil, false
+	}
+	return s.collectUntilQuiet(cmdQuietWindow, 5*time.Second), true
+}
+
+// StartLive berilgan shellCmd'ni davriy ravishda bajarib, bitta xabarni tahrirlab turadi.
+// Eski live (agar bor bo'lsa) avtomatik to'xtatiladi.
+func (s *Session) StartLive(chatID int64, shellCmd string) {
+	s.StopLive()
+
+	out, ok := s.runOnceLocked(shellCmd)
+	if !ok {
+		return
+	}
+
+	stopCh := make(chan struct{})
+	text := formatLiveOutput(out)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	kb := liveStopKeyboard()
+	msg.ReplyMarkup = kb
+	sent, err := s.bot.Send(msg)
+	if err != nil {
+		log.Printf("live initial send (tg=%d): %v", s.TelegramID, err)
+		return
+	}
+
+	s.mu.Lock()
+	s.liveStop = stopCh
+	s.liveMsg = sent.MessageID
+	s.mu.Unlock()
+
+	go s.liveLoop(chatID, sent.MessageID, shellCmd, stopCh)
+}
+
+// StopLive aktiv live task'ni to'xtatadi.
+func (s *Session) StopLive() {
+	s.mu.Lock()
+	stop := s.liveStop
+	s.liveStop = nil
+	s.liveMsg = 0
+	s.mu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+}
+
+func (s *Session) liveLoop(chatID int64, msgID int, shellCmd string, stopCh chan struct{}) {
+	ticker := time.NewTicker(liveInterval)
+	defer ticker.Stop()
+
+	var lastText string
+	stoppedReason := "Avto-to'xtash (3 daq)"
+
+	for tick := 0; tick < liveMaxTicks; tick++ {
+		select {
+		case <-stopCh:
+			stoppedReason = "Foydalanuvchi to'xtatdi"
+			goto finalize
+		case <-s.closeSig:
+			return
+		case <-ticker.C:
+		}
+
+		out, ok := s.runOnceLocked(shellCmd)
+		if !ok {
+			return
+		}
+		lastText = formatLiveOutput(out)
+
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, lastText)
+		edit.ParseMode = tgbotapi.ModeHTML
+		kb := liveStopKeyboard()
+		edit.ReplyMarkup = &kb
+		if _, err := s.bot.Send(edit); err != nil {
+			// "message is not modified" — normal, e'tibor bermaymiz
+			if !strings.Contains(err.Error(), "not modified") {
+				log.Printf("live edit (tg=%d): %v", s.TelegramID, err)
+			}
+		}
+	}
+
+finalize:
+	// Oxirgi tahrir: LIVE markerni "Stopped" bilan almashtirib, tugmani olib tashlaymiz
+	final := strings.Replace(lastText, "🔴 LIVE", "⏹ "+stoppedReason, 1)
+	if final == "" {
+		final = "<i>⏹ " + htmlEscape(stoppedReason) + "</i>"
+	}
+	finalEdit := tgbotapi.NewEditMessageText(chatID, msgID, final)
+	finalEdit.ParseMode = tgbotapi.ModeHTML
+	_, _ = s.bot.Send(finalEdit)
+}
+
+// formatLiveOutput live xabar matnini tayyorlaydi (LIVE marker + timestamp + <pre> output).
+func formatLiveOutput(out []byte) string {
+	clean := strings.TrimRight(stripANSI(string(out)), "\n")
+	if len(clean) > maxMsgChars {
+		clean = "…\n" + clean[len(clean)-maxMsgChars:]
+	}
+	ts := time.Now().Format("15:04:05")
+	return fmt.Sprintf("🔴 LIVE • %s\n<pre>%s</pre>", ts, htmlEscape(clean))
+}
+
+func liveStopKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🛑 Stop", "live:stop"),
+		),
+	)
 }
 
 // sessionReplyKeyboard sessiya davomida pastda turadigan persistent klaviatura.
