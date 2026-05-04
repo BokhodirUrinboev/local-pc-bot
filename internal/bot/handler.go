@@ -154,7 +154,12 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 		b.Mgr.Remove(tgID)
 		return
 	case btnInterrupt:
+		sess.StopLive() // Ctrl+C aktiv live monitoring'ni ham to'xtatadi
 		sess.SendInterrupt()
+		return
+	case "Esc":
+		sess.StopLive() // Esc — "cancel" semantikasi: live'ni to'xtatadi
+		go sess.SendKey(keyButtons["Esc"])
 		return
 	}
 	if raw, ok := keyButtons[text]; ok {
