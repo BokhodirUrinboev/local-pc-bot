@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -14,6 +15,10 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+// altScreenEnter — TUI dasturlari (htop, vim, less, nano) ekranni "alt screen buffer" ga
+// ko'chirganda yuboradigan kod. Aniqlansa bot foydalanuvchini ogohlantiradi va Ctrl+C yuboradi.
+var altScreenEnter = []byte("\x1b[?1049h")
 
 const (
 	cmdQuietWindow = 700 * time.Millisecond // shu vaqt davomida output bo'lmasa "tugagan" deb hisoblaymiz
@@ -243,6 +248,8 @@ func (s *Session) drainAvailable() {
 
 // collectUntilQuiet output kelishini kutadi. Birinchi byte kelganidan keyin "quiet" davomida
 // hech narsa kelmasa — tugadi deb hisoblaydi. max — qattiq cheklov.
+// Agar oqimda alt-screen-enter (TUI signal) aniqlansa darrov qaytadi —
+// foydalanuvchini 15 sek kuttirmaslik uchun.
 func (s *Session) collectUntilQuiet(quiet, max time.Duration) []byte {
 	var out []byte
 	deadline := time.NewTimer(max)
@@ -255,6 +262,9 @@ func (s *Session) collectUntilQuiet(quiet, max time.Duration) []byte {
 			return out
 		}
 		out = append(out, chunk...)
+		if bytes.Contains(chunk, altScreenEnter) {
+			return out
+		}
 	case <-s.interrupt:
 		return out
 	case <-deadline.C:
@@ -273,6 +283,9 @@ func (s *Session) collectUntilQuiet(quiet, max time.Duration) []byte {
 				return out
 			}
 			out = append(out, chunk...)
+			if bytes.Contains(chunk, altScreenEnter) {
+				return out
+			}
 		case <-quietT.C:
 			return out
 		case <-s.interrupt:
@@ -289,18 +302,36 @@ func (s *Session) collectUntilQuiet(quiet, max time.Duration) []byte {
 }
 
 // drainBanner SSH ulanganda kelgan dastlabki output (motd, prompt) ni 1 ta xabarda yuboradi.
+// cmdMu ushlab turadi — yo'qsa user tezda komanda yozsa rawOut ikki o'quvchi o'rtasida
+// taqsimlanib, birinchi belgilar tushib qoladi.
 func (s *Session) drainBanner() {
-	out := s.collectUntilQuiet(cmdQuietWindow, 5*time.Second)
+	s.cmdMu.Lock()
+	defer s.cmdMu.Unlock()
+	out := s.collectUntilQuiet(cmdQuietWindow, 3*time.Second)
 	if len(out) > 0 {
 		s.sendOutput(out)
 	}
 }
 
 // sendOutput collected raw bytes'ni Telegramga jo'natadi.
+// TUI dasturlari (htop, vim, ...) aniqlansa — output o'rniga ogohlantiruv yuboriladi va Ctrl+C jo'natiladi.
 func (s *Session) sendOutput(out []byte) {
+	if bytes.Contains(out, altScreenEnter) {
+		// TUI — to'liq ekranli dastur. Telegram'da ko'rsatib bo'lmaydi.
+		// Avval Ctrl+C yuboramiz (ko'pchilik TUI undan chiqadi yoki signal handlerini ishga tushiradi),
+		// keyin foydalanuvchini ogohlantiramiz.
+		_, _ = io.WriteString(s.Conn.Stdin, "\x03")
+		text := "⚠️ Interaktiv (TUI) komanda aniqlandi va to'xtatildi.\n\n" +
+			"Telegram chatda <code>htop</code>, <code>vim</code>, <code>less</code>, <code>nano</code> kabi to'liq ekranli dasturlar ishlamaydi.\n\n" +
+			"Snapshot uchun shortcut'lardan foydalaning: /htop /ps /disk /uptime /free"
+		msg := tgbotapi.NewMessage(s.ChatID, text)
+		msg.ParseMode = tgbotapi.ModeHTML
+		_, _ = s.bot.Send(msg)
+		return
+	}
+
 	clean := strings.TrimRight(stripANSI(string(out)), "\n")
 	if clean == "" {
-		// Hech narsa qaytarmasa, foydalanuvchi bilsin (komanda ishladi)
 		msg := tgbotapi.NewMessage(s.ChatID, "✓")
 		_, _ = s.bot.Send(msg)
 		return

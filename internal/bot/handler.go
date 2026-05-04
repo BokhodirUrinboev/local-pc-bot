@@ -20,17 +20,50 @@ type Bot struct {
 	API         *tgbotapi.BotAPI
 	Mgr         *Manager
 	PublicURL   string
-	WebAppURL   string // Telegram Mini App URL (web-ssh frontend)
 	rootContext context.Context
 }
 
-func New(api *tgbotapi.BotAPI, mgr *Manager, publicURL, webAppURL string, ctx context.Context) *Bot {
+func New(api *tgbotapi.BotAPI, mgr *Manager, publicURL string, ctx context.Context) *Bot {
 	return &Bot{
 		API:         api,
 		Mgr:         mgr,
 		PublicURL:   strings.TrimRight(publicURL, "/"),
-		WebAppURL:   strings.TrimRight(webAppURL, "/"),
 		rootContext: ctx,
+	}
+}
+
+// shellShortcuts — slash komanda → aktiv sessiyada ishlatiladigan shell buyrug'i.
+// Hammasi NON-INTERACTIVE (TUI emas) — Telegram chat sharoitida snapshot beradi.
+var shellShortcuts = map[string]string{
+	"uptime": "uptime",
+	"disk":   "df -h",
+	"df":     "df -h",
+	"free":   "free -h",
+	"mem":    "free -h",
+	"ps":     "ps auxf | head -30",
+	"htop":   "top -bn1 -o %MEM | head -30",
+	"top":    "top -bn1 -o %MEM | head -30",
+	"who":    "who",
+	"ip":     "ip -br a",
+	"date":   "date",
+}
+
+// BotCommands Telegram'ning slash menyusiga registratsiya qilinadigan komandalar.
+func BotCommands() []tgbotapi.BotCommand {
+	return []tgbotapi.BotCommand{
+		{Command: "start", Description: "Botni ishga tushirish / bog'lanish"},
+		{Command: "servers", Description: "Server ro'yxati"},
+		{Command: "connect", Description: "Serverga ulanish (id bilan)"},
+		{Command: "disconnect", Description: "Sessiyani yopish"},
+		{Command: "uptime", Description: "Server uptime"},
+		{Command: "disk", Description: "Disk: df -h"},
+		{Command: "free", Description: "Xotira: free -h"},
+		{Command: "ps", Description: "Jarayonlar (top 30)"},
+		{Command: "htop", Description: "Top snapshot (top -bn1)"},
+		{Command: "who", Description: "Tizimga kirgan foydalanuvchilar"},
+		{Command: "ip", Description: "IP manzillar (ip -br a)"},
+		{Command: "raw", Description: "Xom baytlar yuborish (hex)"},
+		{Command: "help", Description: "Yordam"},
 	}
 }
 
@@ -74,7 +107,13 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 	tgID := m.From.ID
 
 	if m.IsCommand() {
-		switch m.Command() {
+		cmd := m.Command()
+		// Shell shortcut'lar — aktiv sessiyada mos shell buyrug'ini bajaradi
+		if shellCmd, ok := shellShortcuts[cmd]; ok {
+			b.runShortcut(m, shellCmd)
+			return
+		}
+		switch cmd {
 		case "start":
 			b.cmdStart(m)
 		case "help":
@@ -87,8 +126,6 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 			b.cmdDisconnect(m)
 		case "raw":
 			b.cmdRaw(m)
-		case "web":
-			b.cmdWeb(m)
 		default:
 			b.reply(m.Chat.ID, "Noma'lum komanda. /help")
 		}
@@ -148,17 +185,8 @@ func (b *Bot) cmdStart(m *tgbotapi.Message) {
 	tgID := m.From.ID
 	user, ok := b.lookupUser(tgID)
 	if ok {
-		text := fmt.Sprintf("Salom, <b>%s</b>!\n\n/servers — serverlar ro'yxati\n/web — veb-versiyani ochish\n/help — yordam", htmlEscape(user.Email))
-		msg := tgbotapi.NewMessage(m.Chat.ID, text)
-		msg.ParseMode = tgbotapi.ModeHTML
-		if b.WebAppURL != "" {
-			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonURL("🌐 Remofy veb-versiya", b.WebAppURL),
-				),
-			)
-		}
-		_, _ = b.API.Send(msg)
+		text := fmt.Sprintf("Salom, <b>%s</b>!\n\n/servers — serverlar ro'yxati\n/help — yordam", htmlEscape(user.Email))
+		b.reply(m.Chat.ID, text)
 		return
 	}
 
@@ -177,22 +205,33 @@ func (b *Bot) cmdStart(m *tgbotapi.Message) {
 }
 
 func (b *Bot) cmdHelp(m *tgbotapi.Message) {
-	text := `<b>Remofy bot komandalari</b>
+	text := `<b>Remofy bot — komandalar</b>
 
-/start — botni ishga tushirish, Google bilan bog'lash
+<b>Sessiya:</b>
+/start — bog'lanish (Google)
 /servers — server ro'yxati
 /connect &lt;id&gt; — serverga ulanish
 /disconnect — sessiyani yopish
-/web — veb-versiyani ochish (Telegram ichida)
-/raw &lt;hex&gt; — xom baytlar yuborish (masalan "1b5b41" = ↑)
+
+<b>Tezkor shell snapshotlar (aktiv sessiya kerak):</b>
+/uptime — uptime
+/disk yoki /df — df -h
+/free yoki /mem — free -h
+/ps — ps auxf | head -30
+/htop yoki /top — top -bn1 | head -30
+/who — kirgan foydalanuvchilar
+/ip — IP manzillar
+
+<b>Boshqa:</b>
+/raw &lt;hex&gt; — xom baytlar (masalan "1b5b41" = ↑)
 /help — shu yordam
 
 <b>Sessiya ichida:</b>
-• Har qanday matn — komanda sifatida yuboriladi (Enter avtomatik)
-• Har komanda uchun alohida javob xabari keladi
-• Pastdagi tugmalar: Ctrl+C (uzish), Tab, Enter, ↑↓, Esc, Disconnect
+• Har qanday matn — komanda sifatida yuboriladi
+• Har komanda uchun alohida javob keladi
+• Pastdagi tugmalar: Ctrl+C, Tab, Enter, ↑↓, Esc, Disconnect
 
-<b>Cheklov:</b> vim/htop/nano kabi to'liq ekranli (TUI) dasturlar Telegram'da to'g'ri ishlamasligi mumkin. Komanda 15 sekunddan ortiq tursa output kelmasdan javob beriladi.`
+<b>Cheklov:</b> vim/htop/nano kabi to'liq ekranli (TUI) dasturlar avtomatik to'xtatiladi — snapshot uchun yuqoridagi shortcut'lardan foydalaning.`
 	b.reply(m.Chat.ID, text)
 }
 
@@ -284,21 +323,14 @@ func (b *Bot) cmdRaw(m *tgbotapi.Message) {
 	go sess.SendKey(string(bytes))
 }
 
-func (b *Bot) cmdWeb(m *tgbotapi.Message) {
-	if b.WebAppURL == "" {
-		b.reply(m.Chat.ID, "Veb-versiya URL'i sozlanmagan.")
+// runShortcut shortcut'ni aktiv sessiyada bajaradi.
+func (b *Bot) runShortcut(m *tgbotapi.Message, shellCmd string) {
+	sess := b.Mgr.Get(m.From.ID)
+	if sess == nil {
+		b.reply(m.Chat.ID, "Aktiv sessiya yo'q. /servers ro'yxatdan tanlang.")
 		return
 	}
-	msg := tgbotapi.NewMessage(m.Chat.ID, "🌐 Remofy veb-versiyasini oching.\n<i>Eslatma:</i> input maydoni yonidagi Menyu tugmasi (◇) ham Mini App'ni Telegram ichida ochadi.")
-	msg.ParseMode = tgbotapi.ModeHTML
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonURL("Remofy oching", b.WebAppURL),
-		),
-	)
-	if _, err := b.API.Send(msg); err != nil {
-		log.Printf("cmdWeb send: %v", err)
-	}
+	go sess.RunCommand(shellCmd)
 }
 
 // --- Yordamchi ---
