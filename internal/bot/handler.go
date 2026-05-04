@@ -20,12 +20,33 @@ type Bot struct {
 	API         *tgbotapi.BotAPI
 	Mgr         *Manager
 	PublicURL   string
+	WebAppURL   string // Telegram Mini App URL (web-ssh frontend)
 	rootContext context.Context
 }
 
-func New(api *tgbotapi.BotAPI, mgr *Manager, publicURL string, ctx context.Context) *Bot {
-	return &Bot{API: api, Mgr: mgr, PublicURL: strings.TrimRight(publicURL, "/"), rootContext: ctx}
+func New(api *tgbotapi.BotAPI, mgr *Manager, publicURL, webAppURL string, ctx context.Context) *Bot {
+	return &Bot{
+		API:         api,
+		Mgr:         mgr,
+		PublicURL:   strings.TrimRight(publicURL, "/"),
+		WebAppURL:   strings.TrimRight(webAppURL, "/"),
+		rootContext: ctx,
+	}
 }
+
+// keyButtons — reply keyboard'dagi tugma label'lari → SSH stdin'ga yoziladigan raw kodlar.
+var keyButtons = map[string]string{
+	"Tab":   "\t",
+	"Enter": "\n",
+	"↑":     "\x1b[A",
+	"↓":     "\x1b[B",
+	"Esc":   "\x1b",
+}
+
+const (
+	btnInterrupt  = "Ctrl+C"
+	btnDisconnect = "🔌 Disconnect"
+)
 
 // OnLinked — auth paketi tomonidan OAuth callback muvaffaqiyatli bo'lganda chaqiriladi.
 func (b *Bot) OnLinked(telegramID int64, user models.User) {
@@ -52,7 +73,6 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 	}
 	tgID := m.From.ID
 
-	// Komanda?
 	if m.IsCommand() {
 		switch m.Command() {
 		case "start":
@@ -67,26 +87,43 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 			b.cmdDisconnect(m)
 		case "raw":
 			b.cmdRaw(m)
+		case "web":
+			b.cmdWeb(m)
 		default:
 			b.reply(m.Chat.ID, "Noma'lum komanda. /help")
 		}
 		return
 	}
 
-	// Komanda emas — aktiv sessiyaga yuboramiz
 	sess := b.Mgr.Get(tgID)
 	if sess == nil {
 		b.reply(m.Chat.ID, "Aktiv sessiya yo'q. /servers ro'yxatdan tanlang yoki /connect <id>")
 		return
 	}
-	if err := sess.WriteInput(m.Text, true); err != nil {
-		b.reply(m.Chat.ID, "Yozib bo'lmadi: "+err.Error())
+
+	text := m.Text
+
+	// Reply keyboard tugmalari
+	switch text {
+	case btnDisconnect:
+		sess.Close("foydalanuvchi tomonidan uzildi")
+		b.Mgr.Remove(tgID)
+		return
+	case btnInterrupt:
+		sess.SendInterrupt()
+		return
 	}
+	if raw, ok := keyButtons[text]; ok {
+		go sess.SendKey(raw)
+		return
+	}
+
+	// Oddiy komanda
+	go sess.RunCommand(text)
 }
 
 func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 	defer func() {
-		// Telegramga callback'ni ack qilish
 		_, _ = b.API.Request(tgbotapi.NewCallback(cb.ID, ""))
 	}()
 
@@ -95,46 +132,14 @@ func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 	}
 	data := cb.Data
 
-	switch {
-	case strings.HasPrefix(data, "connect:"):
+	if strings.HasPrefix(data, "connect:") {
 		idStr := strings.TrimPrefix(data, "connect:")
 		serverID, err := strconv.ParseUint(idStr, 10, 64)
 		if err != nil {
 			return
 		}
 		b.connectByID(cb.From.ID, cb.Message.Chat.ID, uint(serverID))
-
-	case strings.HasPrefix(data, "key:"):
-		key := strings.TrimPrefix(data, "key:")
-		raw, ok := specialKeys[key]
-		if !ok {
-			return
-		}
-		sess := b.Mgr.Get(cb.From.ID)
-		if sess == nil {
-			b.reply(cb.Message.Chat.ID, "Aktiv sessiya yo'q.")
-			return
-		}
-		_ = sess.WriteInput(raw, false)
-
-	case data == "session:disconnect":
-		sess := b.Mgr.Get(cb.From.ID)
-		if sess != nil {
-			sess.Close("foydalanuvchi tomonidan uzildi")
-			b.Mgr.Remove(cb.From.ID)
-		} else {
-			b.reply(cb.Message.Chat.ID, "Aktiv sessiya yo'q.")
-		}
 	}
-}
-
-var specialKeys = map[string]string{
-	"ctrlc": "\x03",
-	"tab":   "\t",
-	"enter": "\n",
-	"up":    "\x1b[A",
-	"down":  "\x1b[B",
-	"esc":   "\x1b",
 }
 
 // --- Komandalar ---
@@ -143,15 +148,23 @@ func (b *Bot) cmdStart(m *tgbotapi.Message) {
 	tgID := m.From.ID
 	user, ok := b.lookupUser(tgID)
 	if ok {
-		b.reply(m.Chat.ID, fmt.Sprintf("Salom, <b>%s</b>!\n\n/servers — serverlar ro'yxati\n/help — yordam", htmlEscape(user.Email)))
+		text := fmt.Sprintf("Salom, <b>%s</b>!\n\n/servers — serverlar ro'yxati\n/web — veb-versiyani ochish\n/help — yordam", htmlEscape(user.Email))
+		msg := tgbotapi.NewMessage(m.Chat.ID, text)
+		msg.ParseMode = tgbotapi.ModeHTML
+		if b.WebAppURL != "" {
+			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonURL("🌐 Remofy veb-versiya", b.WebAppURL),
+				),
+			)
+		}
+		_, _ = b.API.Send(msg)
 		return
 	}
 
 	state := auth.NewLinkToken(tgID, m.From.UserName)
 	url := fmt.Sprintf("%s/auth/google/login?state=%s", b.PublicURL, state)
-
-	text := "👋 Remofy botiga xush kelibsiz!\n\n" +
-		"Boshlash uchun Google akkaunti bilan bog'laning. Link 10 daqiqa amal qiladi:"
+	text := "👋 Remofy botiga xush kelibsiz!\n\nBoshlash uchun Google akkaunti bilan bog'laning. Link 10 daqiqa amal qiladi:"
 	msg := tgbotapi.NewMessage(m.Chat.ID, text)
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -170,14 +183,16 @@ func (b *Bot) cmdHelp(m *tgbotapi.Message) {
 /servers — server ro'yxati
 /connect &lt;id&gt; — serverga ulanish
 /disconnect — sessiyani yopish
+/web — veb-versiyani ochish (Telegram ichida)
 /raw &lt;hex&gt; — xom baytlar yuborish (masalan "1b5b41" = ↑)
 /help — shu yordam
 
 <b>Sessiya ichida:</b>
 • Har qanday matn — komanda sifatida yuboriladi (Enter avtomatik)
-• Ostidagi tugmalar: Ctrl+C, Tab, Enter, ↑↓, Esc, Disconnect
+• Har komanda uchun alohida javob xabari keladi
+• Pastdagi tugmalar: Ctrl+C (uzish), Tab, Enter, ↑↓, Esc, Disconnect
 
-<b>Cheklov:</b> vim/htop/nano kabi to'liq ekranli (TUI) dasturlar Telegram'da to'g'ri ishlamasligi mumkin.`
+<b>Cheklov:</b> vim/htop/nano kabi to'liq ekranli (TUI) dasturlar Telegram'da to'g'ri ishlamasligi mumkin. Komanda 15 sekunddan ortiq tursa output kelmasdan javob beriladi.`
 	b.reply(m.Chat.ID, text)
 }
 
@@ -228,7 +243,7 @@ func (b *Bot) cmdConnect(m *tgbotapi.Message) {
 		b.reply(m.Chat.ID, "ID raqam bo'lishi kerak.")
 		return
 	}
-	_ = user // user.ID quyidagi connectByID ichida tekshiriladi
+	_ = user
 	b.connectByID(m.From.ID, m.Chat.ID, uint(id))
 }
 
@@ -266,8 +281,23 @@ func (b *Bot) cmdRaw(m *tgbotapi.Message) {
 		}
 		bytes[i] = byte(v)
 	}
-	if err := sess.WriteInput(string(bytes), false); err != nil {
-		b.reply(m.Chat.ID, "Yozish xato: "+err.Error())
+	go sess.SendKey(string(bytes))
+}
+
+func (b *Bot) cmdWeb(m *tgbotapi.Message) {
+	if b.WebAppURL == "" {
+		b.reply(m.Chat.ID, "Veb-versiya URL'i sozlanmagan.")
+		return
+	}
+	msg := tgbotapi.NewMessage(m.Chat.ID, "🌐 Remofy veb-versiyasini oching.\n<i>Eslatma:</i> input maydoni yonidagi Menyu tugmasi (◇) ham Mini App'ni Telegram ichida ochadi.")
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("Remofy oching", b.WebAppURL),
+		),
+	)
+	if _, err := b.API.Send(msg); err != nil {
+		log.Printf("cmdWeb send: %v", err)
 	}
 }
 

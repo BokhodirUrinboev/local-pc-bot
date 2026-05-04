@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -26,6 +27,7 @@ func main() {
 
 	token := mustEnv("TELEGRAM_BOT_TOKEN")
 	publicURL := mustEnv("PUBLIC_BASE_URL")
+	webAppURL := os.Getenv("WEB_APP_URL") // bo'sh bo'lsa Mini App o'chiriladi
 	httpPort := os.Getenv("BOT_HTTP_PORT")
 	if httpPort == "" {
 		httpPort = "8090"
@@ -47,10 +49,20 @@ func main() {
 	defer rootCancel()
 
 	mgr := bot.NewManager(api, idleTimeout)
-	b := bot.New(api, mgr, publicURL, rootCtx)
+	b := bot.New(api, mgr, publicURL, webAppURL, rootCtx)
 
 	auth.Init(b.OnLinked)
 	auth.StartGC()
+
+	// Mini App (web_app) menu button — har bir foydalanuvchi uchun input maydoni yonida ko'rinadi.
+	// v5.5.1 da WebApp tipi yo'q, shuning uchun raw API call.
+	if webAppURL != "" {
+		if err := setWebAppMenuButton(api, webAppURL, "Remofy"); err != nil {
+			log.Printf("setChatMenuButton failed: %v", err)
+		} else {
+			log.Printf("Menu button set to web_app: %s", webAppURL)
+		}
+	}
 
 	// HTTP server (OAuth callback)
 	mux := http.NewServeMux()
@@ -76,7 +88,6 @@ func main() {
 	uCfg.Timeout = 30
 	updates := api.GetUpdatesChan(uCfg)
 
-	// Graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
@@ -96,6 +107,23 @@ func main() {
 			return
 		}
 	}
+}
+
+// setWebAppMenuButton bot uchun default menu button'ni "web_app" turiga o'rnatadi.
+// Bu Telegram Bot API 6.0+ method'i — kutubxona uni helper sifatida bermagani uchun
+// MakeRequest orqali to'g'ridan-to'g'ri chaqiramiz.
+func setWebAppMenuButton(api *tgbotapi.BotAPI, url, text string) error {
+	menu, err := json.Marshal(map[string]any{
+		"type":    "web_app",
+		"text":    text,
+		"web_app": map[string]string{"url": url},
+	})
+	if err != nil {
+		return err
+	}
+	params := tgbotapi.Params{"menu_button": string(menu)}
+	_, err = api.MakeRequest("setChatMenuButton", params)
+	return err
 }
 
 func mustEnv(key string) string {

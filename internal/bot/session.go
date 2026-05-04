@@ -2,10 +2,10 @@ package bot
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,33 +16,33 @@ import (
 )
 
 const (
-	bufferLines  = 30
-	flushDelay   = 800 * time.Millisecond
-	idleDefault  = 30 * time.Minute
-	maxAnchorAge = 30 * time.Minute // bitta xabar maksimum shu vaqt edit qilinadi
+	cmdQuietWindow = 700 * time.Millisecond // shu vaqt davomida output bo'lmasa "tugagan" deb hisoblaymiz
+	cmdMaxWait     = 15 * time.Second       // bitta komandaga maksimum kutish
+	idleDefault    = 30 * time.Minute
+	maxMsgChars    = 3800 // Telegram 4096 limit minus <pre>...</pre> tag joyi
 )
 
 // Session — bir Telegram foydalanuvchisining ulangan SSH sessiyasi.
+// Har bir komanda → bitta javob xabari (1-to-1).
 type Session struct {
 	TelegramID  int64
 	ChatID      int64
 	Server      models.Server
 	Conn        *sshconn.Conn
-	Buffer      *Buffer
-	AnchorMsgID int
-	AnchorAt    time.Time
 	LastInputAt time.Time
 
 	bot         *tgbotapi.BotAPI
 	idleTimeout time.Duration
 
-	flushSig chan struct{}
-	closeSig chan struct{}
-	closed   bool
-	mu       sync.Mutex
+	rawOut    chan []byte   // SSH stdout chunklari
+	interrupt chan struct{} // Ctrl+C kutayotgan komandani uzish
+	closeSig  chan struct{}
+	closed    bool
+
+	cmdMu sync.Mutex // bir vaqtda bitta komanda
+	mu    sync.Mutex
 }
 
-// Manager — barcha aktiv sessiyalar.
 type Manager struct {
 	mu          sync.Mutex
 	sessions    map[int64]*Session
@@ -54,11 +54,7 @@ func NewManager(bot *tgbotapi.BotAPI, idle time.Duration) *Manager {
 	if idle <= 0 {
 		idle = idleDefault
 	}
-	return &Manager{
-		sessions:    map[int64]*Session{},
-		bot:         bot,
-		idleTimeout: idle,
-	}
+	return &Manager{sessions: map[int64]*Session{}, bot: bot, idleTimeout: idle}
 }
 
 func (m *Manager) Get(telegramID int64) *Session {
@@ -67,14 +63,17 @@ func (m *Manager) Get(telegramID int64) *Session {
 	return m.sessions[telegramID]
 }
 
-// Open yangi sessiya ochadi (eskisini yopib). Anchor xabar yaratiladi.
+func (m *Manager) Remove(telegramID int64) {
+	m.mu.Lock()
+	delete(m.sessions, telegramID)
+	m.mu.Unlock()
+}
+
+// Open yangi sessiya ochadi (eski bo'lsa yopib). Welcome xabar reply keyboard bilan yuboriladi.
 func (m *Manager) Open(ctx context.Context, telegramID, chatID int64, server models.Server) (*Session, error) {
-	// Eski sessiya bo'lsa — yopamiz
 	if old := m.Get(telegramID); old != nil {
 		old.Close("yangi ulanish ochildi")
-		m.mu.Lock()
-		delete(m.sessions, telegramID)
-		m.mu.Unlock()
+		m.Remove(telegramID)
 	}
 
 	conn, err := sshconn.Open(ctx, server)
@@ -87,39 +86,36 @@ func (m *Manager) Open(ctx context.Context, telegramID, chatID int64, server mod
 		ChatID:      chatID,
 		Server:      server,
 		Conn:        conn,
-		Buffer:      NewBuffer(bufferLines),
 		LastInputAt: time.Now(),
 		bot:         m.bot,
 		idleTimeout: m.idleTimeout,
-		flushSig:    make(chan struct{}, 1),
+		rawOut:      make(chan []byte, 64),
+		interrupt:   make(chan struct{}, 1),
 		closeSig:    make(chan struct{}),
 	}
 
-	// Anchor xabar yaratish
-	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔌 <b>%s</b> ga ulandi (%s@%s:%d)\n<i>Komanda yozing yoki /disconnect</i>",
-		htmlEscape(server.Name), htmlEscape(server.Username), htmlEscape(server.Host), server.Port))
+	welcome := fmt.Sprintf("🔌 <b>%s</b> ga ulandi (%s@%s:%d)\n<i>Komanda yozing — har biri uchun alohida javob keladi</i>",
+		htmlEscape(server.Name), htmlEscape(server.Username), htmlEscape(server.Host), server.Port)
+	msg := tgbotapi.NewMessage(chatID, welcome)
 	msg.ParseMode = tgbotapi.ModeHTML
-	msg.ReplyMarkup = sessionKeyboard()
-	sent, err := m.bot.Send(msg)
-	if err != nil {
+	msg.ReplyMarkup = sessionReplyKeyboard()
+	if _, err := m.bot.Send(msg); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("anchor send: %w", err)
+		return nil, fmt.Errorf("welcome send: %w", err)
 	}
-	s.AnchorMsgID = sent.MessageID
-	s.AnchorAt = time.Now()
 
 	m.mu.Lock()
 	m.sessions[telegramID] = s
 	m.mu.Unlock()
 
 	go s.readPump()
-	go s.flushPump()
 	go s.idleWatchdog(m)
+	go s.drainBanner() // motd, dastlabki prompt
 
 	return s, nil
 }
 
-// Close sessiyani yopadi. reason — Telegramga yuboriladigan xabar.
+// Close sessiyani yopadi va keyboard'ni olib tashlaydi.
 func (s *Session) Close(reason string) {
 	s.mu.Lock()
 	if s.closed {
@@ -135,51 +131,97 @@ func (s *Session) Close(reason string) {
 	}
 	if reason != "" {
 		msg := tgbotapi.NewMessage(s.ChatID, "🔌 Sessiya yopildi: "+reason)
+		msg.ReplyMarkup = tgbotapi.NewRemoveKeyboard(true)
 		_, _ = s.bot.Send(msg)
 	}
 }
 
-// Remove managerdan ham o'chiradi.
-func (m *Manager) Remove(telegramID int64) {
-	m.mu.Lock()
-	delete(m.sessions, telegramID)
-	m.mu.Unlock()
+// RunCommand foydalanuvchi yozgan komandani bajaradi va outputni 1 ta xabarda yuboradi.
+// cmdMu bilan ketma-ket bajariladi.
+func (s *Session) RunCommand(text string) {
+	s.cmdMu.Lock()
+	defer s.cmdMu.Unlock()
+
+	if !s.markActive() {
+		return
+	}
+
+	s.drainAvailable()
+
+	if _, err := io.WriteString(s.Conn.Stdin, text+"\n"); err != nil {
+		s.replyError("Yozish xato: " + err.Error())
+		return
+	}
+
+	out := s.collectUntilQuiet(cmdQuietWindow, cmdMaxWait)
+	s.sendOutput(out)
 }
 
-// WriteInput foydalanuvchi xabarini SSH stdin'ga yuboradi.
-// trailingNewline — odatda true (komanda enter bilan tugashi kerak).
-func (s *Session) WriteInput(data string, trailingNewline bool) error {
+// SendKey maxsus tugma (Tab, Enter, ↑↓, Esc, Disconnect emas) — komanda kabi yuboriladi,
+// lekin newline qo'shilmaydi (raw kod).
+func (s *Session) SendKey(raw string) {
+	s.cmdMu.Lock()
+	defer s.cmdMu.Unlock()
+
+	if !s.markActive() {
+		return
+	}
+
+	s.drainAvailable()
+
+	if _, err := io.WriteString(s.Conn.Stdin, raw); err != nil {
+		s.replyError("Yozish xato: " + err.Error())
+		return
+	}
+
+	out := s.collectUntilQuiet(cmdQuietWindow, cmdMaxWait)
+	s.sendOutput(out)
+}
+
+// SendInterrupt Ctrl+C — cmdMu'ni KUTMAYDI, to'g'ridan-to'g'ri stdin'ga yozadi
+// va kutayotgan collectUntilQuiet'ni to'xtatadi.
+func (s *Session) SendInterrupt() {
+	if !s.markActive() {
+		return
+	}
+	if _, err := io.WriteString(s.Conn.Stdin, "\x03"); err != nil {
+		log.Printf("interrupt write (tg=%d): %v", s.TelegramID, err)
+		return
+	}
+	select {
+	case s.interrupt <- struct{}{}:
+	default:
+	}
+}
+
+// markActive timestamp yangilaydi va sessiya tirik ekanini tekshiradi.
+func (s *Session) markActive() bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
-		return errors.New("session closed")
+		return false
 	}
 	s.LastInputAt = time.Now()
-	s.mu.Unlock()
-
-	payload := data
-	if trailingNewline {
-		payload += "\n"
-	}
-	_, err := io.WriteString(s.Conn.Stdin, payload)
-	return err
+	return true
 }
 
-// readPump SSH stdout dan o'qib, Buffer ga yozadi va flushSig'ni signallaydi.
+// readPump SSH stdout'dan o'qib, rawOut kanaliga yuboradi.
 func (s *Session) readPump() {
-	buf := make([]byte, 4096)
+	buf := make([]byte, 8192)
 	for {
 		n, err := s.Conn.Stdout.Read(buf)
 		if n > 0 {
-			s.Buffer.Append(buf[:n])
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
 			select {
-			case s.flushSig <- struct{}{}:
-			default:
+			case s.rawOut <- chunk:
+			case <-s.closeSig:
+				return
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("read pump (tg=%d): %v", s.TelegramID, err)
+				log.Printf("readPump (tg=%d): %v", s.TelegramID, err)
 			}
 			s.Close("ulanish uzildi")
 			return
@@ -187,73 +229,99 @@ func (s *Session) readPump() {
 	}
 }
 
-// flushPump debounce qilib Telegram xabarini yangilaydi.
-func (s *Session) flushPump() {
-	var pending bool
-	timer := time.NewTimer(time.Hour)
-	timer.Stop()
-
+// drainAvailable rawOut'da to'planib qolgan eski byte'larni tashlab yuboradi (oldingi
+// komandadan kech kelgan prompt va h.k.). BLOK QILMAYDI.
+func (s *Session) drainAvailable() {
 	for {
 		select {
+		case <-s.rawOut:
+		default:
+			return
+		}
+	}
+}
+
+// collectUntilQuiet output kelishini kutadi. Birinchi byte kelganidan keyin "quiet" davomida
+// hech narsa kelmasa — tugadi deb hisoblaydi. max — qattiq cheklov.
+func (s *Session) collectUntilQuiet(quiet, max time.Duration) []byte {
+	var out []byte
+	deadline := time.NewTimer(max)
+	defer deadline.Stop()
+
+	// 1) Birinchi byte (yoki deadline / interrupt / close)
+	select {
+	case chunk, ok := <-s.rawOut:
+		if !ok {
+			return out
+		}
+		out = append(out, chunk...)
+	case <-s.interrupt:
+		return out
+	case <-deadline.C:
+		return out
+	case <-s.closeSig:
+		return out
+	}
+
+	// 2) Quiet oynasi
+	for {
+		quietT := time.NewTimer(quiet)
+		select {
+		case chunk, ok := <-s.rawOut:
+			quietT.Stop()
+			if !ok {
+				return out
+			}
+			out = append(out, chunk...)
+		case <-quietT.C:
+			return out
+		case <-s.interrupt:
+			quietT.Stop()
+			return out
+		case <-deadline.C:
+			quietT.Stop()
+			return out
 		case <-s.closeSig:
-			// Oxirgi marta yangilab chiqamiz
-			if pending {
-				s.flush()
-			}
-			return
-		case <-s.flushSig:
-			if !pending {
-				pending = true
-				timer.Reset(flushDelay)
-			}
-		case <-timer.C:
-			pending = false
-			s.flush()
+			quietT.Stop()
+			return out
 		}
 	}
 }
 
-// flush hozirgi buffer snapshot'ini Telegramga yuboradi (edit yoki yangi xabar).
-func (s *Session) flush() {
-	if s.Buffer.IsEmpty() {
-		return
-	}
-	body := s.Buffer.Snapshot()
-	if body == "" {
-		return
-	}
-	text := "<pre>" + body + "</pre>"
-
-	// Anchor juda eski yoki to'lib qolgan bo'lsa yangi xabar yaratamiz
-	rotate := time.Since(s.AnchorAt) > maxAnchorAge
-
-	if !rotate {
-		edit := tgbotapi.NewEditMessageText(s.ChatID, s.AnchorMsgID, text)
-		edit.ParseMode = tgbotapi.ModeHTML
-		kb := sessionKeyboard()
-		edit.ReplyMarkup = &kb
-		if _, err := s.bot.Send(edit); err != nil {
-			// Edit ishlamasa — yangi xabar
-			rotate = true
-		}
-	}
-
-	if rotate {
-		msg := tgbotapi.NewMessage(s.ChatID, text)
-		msg.ParseMode = tgbotapi.ModeHTML
-		msg.ReplyMarkup = sessionKeyboard()
-		sent, err := s.bot.Send(msg)
-		if err != nil {
-			log.Printf("flush new msg (tg=%d): %v", s.TelegramID, err)
-			return
-		}
-		s.AnchorMsgID = sent.MessageID
-		s.AnchorAt = time.Now()
-		s.Buffer.Reset()
+// drainBanner SSH ulanganda kelgan dastlabki output (motd, prompt) ni 1 ta xabarda yuboradi.
+func (s *Session) drainBanner() {
+	out := s.collectUntilQuiet(cmdQuietWindow, 5*time.Second)
+	if len(out) > 0 {
+		s.sendOutput(out)
 	}
 }
 
-// idleWatchdog idle timeoutdan o'tsa sessiyani yopadi.
+// sendOutput collected raw bytes'ni Telegramga jo'natadi.
+func (s *Session) sendOutput(out []byte) {
+	clean := strings.TrimRight(stripANSI(string(out)), "\n")
+	if clean == "" {
+		// Hech narsa qaytarmasa, foydalanuvchi bilsin (komanda ishladi)
+		msg := tgbotapi.NewMessage(s.ChatID, "✓")
+		_, _ = s.bot.Send(msg)
+		return
+	}
+	if len(clean) > maxMsgChars {
+		clean = "…\n" + clean[len(clean)-maxMsgChars:]
+	}
+	msg := tgbotapi.NewMessage(s.ChatID, "<pre>"+htmlEscape(clean)+"</pre>")
+	msg.ParseMode = tgbotapi.ModeHTML
+	if _, err := s.bot.Send(msg); err != nil {
+		log.Printf("sendOutput (tg=%d): %v", s.TelegramID, err)
+	}
+}
+
+// replyError xatolik xabarini yuboradi (oddiy text).
+func (s *Session) replyError(text string) {
+	msg := tgbotapi.NewMessage(s.ChatID, "⚠️ "+text)
+	_, _ = s.bot.Send(msg)
+}
+
+// idleWatchdog idle bo'lsa avtomatik yopadi.
 func (s *Session) idleWatchdog(m *Manager) {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
@@ -275,21 +343,23 @@ func (s *Session) idleWatchdog(m *Manager) {
 	}
 }
 
-// sessionKeyboard aktiv sessiya ostidagi tugmalar.
-func sessionKeyboard() tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Ctrl+C", "key:ctrlc"),
-			tgbotapi.NewInlineKeyboardButtonData("Tab", "key:tab"),
-			tgbotapi.NewInlineKeyboardButtonData("Enter", "key:enter"),
+// sessionReplyKeyboard sessiya davomida pastda turadigan persistent klaviatura.
+func sessionReplyKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	kb := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Ctrl+C"),
+			tgbotapi.NewKeyboardButton("Tab"),
+			tgbotapi.NewKeyboardButton("Enter"),
 		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("↑", "key:up"),
-			tgbotapi.NewInlineKeyboardButtonData("↓", "key:down"),
-			tgbotapi.NewInlineKeyboardButtonData("Esc", "key:esc"),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("↑"),
+			tgbotapi.NewKeyboardButton("↓"),
+			tgbotapi.NewKeyboardButton("Esc"),
 		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔌 Disconnect", "session:disconnect"),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("🔌 Disconnect"),
 		),
 	)
+	kb.ResizeKeyboard = true
+	return kb
 }

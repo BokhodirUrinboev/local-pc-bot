@@ -90,7 +90,7 @@ func Open(parent context.Context, server models.Server) (*Conn, error) {
 	}
 
 	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
+		ssh.ECHO:          0, // Telegram chat'da foydalanuvchi yozganini ko'radi — echo kerak emas
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}
