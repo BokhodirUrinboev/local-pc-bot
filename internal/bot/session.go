@@ -53,6 +53,11 @@ type Session struct {
 	// Live shortcut state (faqat bitta aktiv bo'la oladi)
 	liveStop chan struct{} // close qilinsa goroutine to'xtaydi
 	liveMsg  int           // hozir tahrirlanayotgan xabar IDsi
+
+	// Claude rejimi state
+	claudeMode      bool               // true bo'lsa har bir matn promptga aylanadi
+	claudeSessionID string             // claude-cli session_id (--resume uchun)
+	claudeCancel    context.CancelFunc // aktiv claude exec'ni uzish uchun
 }
 
 type Manager struct {
@@ -141,6 +146,11 @@ func (s *Session) Close(reason string) {
 		close(s.liveStop)
 		s.liveStop = nil
 	}
+	// Aktiv Claude exec'ni ham bekor qilamiz
+	if s.claudeCancel != nil {
+		s.claudeCancel()
+		s.claudeCancel = nil
+	}
 	s.mu.Unlock()
 
 	if s.Conn != nil {
@@ -196,11 +206,21 @@ func (s *Session) SendKey(raw string) {
 }
 
 // SendInterrupt Ctrl+C — cmdMu'ni KUTMAYDI, to'g'ridan-to'g'ri stdin'ga yozadi
-// va kutayotgan collectUntilQuiet'ni to'xtatadi.
+// va kutayotgan collectUntilQuiet'ni to'xtatadi. Aktiv Claude exec ham uziladi.
 func (s *Session) SendInterrupt() {
 	if !s.markActive() {
 		return
 	}
+
+	// Aktiv Claude promptini ham bekor qilamiz (alohida ssh exec sessiyada ishlaydi)
+	s.mu.Lock()
+	cancel := s.claudeCancel
+	s.claudeCancel = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
 	if _, err := io.WriteString(s.Conn.Stdin, "\x03"); err != nil {
 		log.Printf("interrupt write (tg=%d): %v", s.TelegramID, err)
 		return

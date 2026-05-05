@@ -142,6 +142,52 @@ func Open(parent context.Context, server models.Server) (*Conn, error) {
 	}, nil
 }
 
+// Exec asosiy PTY shelldan tashqarida bitta komandani ishga tushiradi va uning
+// stdout+stderr birlashtirilgan oqimini qaytaradi. Toza chiqish kerak bo'lganda
+// (masalan stream-json parse qilish uchun) ishlatiladi.
+//
+// ctx bekor qilinsa SIGTERM yuboriladi va sessiya yopiladi.
+// Wait funksiyasi qo'ng'iroq qiluvchi tomonidan oxirida chaqirilishi shart —
+// u remote process tugashini kutadi va sessiyani toza yopadi.
+func (c *Conn) Exec(ctx context.Context, cmd string) (io.Reader, func() error, error) {
+	sess, err := c.Client.NewSession()
+	if err != nil {
+		return nil, nil, fmt.Errorf("new exec session: %w", err)
+	}
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		_ = sess.Close()
+		return nil, nil, fmt.Errorf("exec stdout: %w", err)
+	}
+	stderr, err := sess.StderrPipe()
+	if err != nil {
+		_ = sess.Close()
+		return nil, nil, fmt.Errorf("exec stderr: %w", err)
+	}
+	if err := sess.Start(cmd); err != nil {
+		_ = sess.Close()
+		return nil, nil, fmt.Errorf("exec start: %w", err)
+	}
+
+	cancelDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = sess.Signal(ssh.SIGTERM)
+			_ = sess.Close()
+		case <-cancelDone:
+		}
+	}()
+
+	wait := func() error {
+		err := sess.Wait()
+		close(cancelDone)
+		_ = sess.Close()
+		return err
+	}
+	return io.MultiReader(stdout, stderr), wait, nil
+}
+
 func (c *Conn) Close() {
 	if c == nil {
 		return

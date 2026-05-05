@@ -13,6 +13,7 @@ Bot mavjud Remofy ma'lumotlar bazasini (PostgreSQL) o'qiydi — foydalanuvchi we
 - **Xom baytlar:** `/raw <hex>` — istalgan kontrol kodlarni yuborish
 - **Auto-disconnect:** 30 daqiqa bo'sh tursa sessiya yopiladi
 - **Keepalive:** SSH `keepalive@openssh.com` har 30 sek (uzoq sessiyalar uzilib qolmasligi uchun)
+- **Claude rejimi:** `/claude` — serverdagi `claude` CLI bilan real-time AI suhbat (`claude -p --output-format stream-json --include-partial-messages`); javob bitta xabarda strim qilib yangilanadi, suhbat konteksti `--resume` orqali saqlanadi. `Ctrl+C` aktiv promptni uzadi, `/endclaude` rejimdan chiqaradi.
 
 ## Sozlash
 

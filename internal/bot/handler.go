@@ -70,6 +70,8 @@ func BotCommands() []tgbotapi.BotCommand {
 		{Command: "who", Description: "Tizimga kirgan foydalanuvchilar"},
 		{Command: "ip", Description: "IP manzillar (ip -br a)"},
 		{Command: "raw", Description: "Xom baytlar yuborish (hex)"},
+		{Command: "claude", Description: "Claude rejimi (real-time AI suhbat)"},
+		{Command: "endclaude", Description: "Claude rejimidan chiqish"},
 		{Command: "help", Description: "Yordam"},
 	}
 }
@@ -133,6 +135,10 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 			b.cmdDisconnect(m)
 		case "raw":
 			b.cmdRaw(m)
+		case "claude":
+			b.cmdClaude(m)
+		case "endclaude":
+			b.cmdEndClaude(m)
 		default:
 			b.reply(m.Chat.ID, "Noma'lum komanda. /help")
 		}
@@ -147,7 +153,7 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 
 	text := m.Text
 
-	// Reply keyboard tugmalari
+	// Reply keyboard tugmalari (Ctrl+C / Disconnect Claude rejimida ham ishlaydi)
 	switch text {
 	case btnDisconnect:
 		sess.Close("foydalanuvchi tomonidan uzildi")
@@ -157,6 +163,15 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 		sess.StopLive() // Ctrl+C aktiv live monitoring'ni ham to'xtatadi
 		sess.SendInterrupt()
 		return
+	}
+
+	// Claude rejimi: maxsus tugmalardan tashqari hamma matn promptga aylanadi
+	if sess.IsClaudeMode() {
+		go sess.RunClaude(text)
+		return
+	}
+
+	switch text {
 	case "Esc":
 		sess.StopLive() // Esc — "cancel" semantikasi: live'ni to'xtatadi
 		go sess.SendKey(keyButtons["Esc"])
@@ -243,6 +258,12 @@ func (b *Bot) cmdHelp(m *tgbotapi.Message) {
 /who — kirgan foydalanuvchilar
 /ip — IP manzillar
 /date — joriy vaqt
+
+<b>🤖 Claude (real-time AI):</b>
+/claude — Claude rejimini yoqish (har bir xabar promptga aylanadi, javob strim qilinadi)
+/claude &lt;savol&gt; — bitta promptni darhol yuborish
+/endclaude — rejimdan chiqish
+<i>Server tomonida <code>claude</code> CLI o'rnatilgan bo'lishi shart. Aktiv promptni Ctrl+C orqali uzish mumkin.</i>
 
 <b>Boshqa:</b>
 /raw &lt;hex&gt; — xom baytlar (masalan "1b5b41" = ↑)
@@ -343,6 +364,37 @@ func (b *Bot) cmdRaw(m *tgbotapi.Message) {
 		bytes[i] = byte(v)
 	}
 	go sess.SendKey(string(bytes))
+}
+
+// cmdClaude — Claude rejimini yoqadi yoki argument bilan birga bitta promptni
+// darhol yuboradi (rejim ham yoqiladi).
+func (b *Bot) cmdClaude(m *tgbotapi.Message) {
+	sess := b.Mgr.Get(m.From.ID)
+	if sess == nil {
+		b.reply(m.Chat.ID, "Aktiv sessiya yo'q. /servers ro'yxatdan tanlang.")
+		return
+	}
+	args := strings.TrimSpace(m.CommandArguments())
+	if !sess.IsClaudeMode() {
+		sess.EnterClaudeMode()
+	}
+	if args != "" {
+		go sess.RunClaude(args)
+	}
+}
+
+// cmdEndClaude Claude rejimidan chiqadi va session ID'ni tozalaydi.
+func (b *Bot) cmdEndClaude(m *tgbotapi.Message) {
+	sess := b.Mgr.Get(m.From.ID)
+	if sess == nil {
+		b.reply(m.Chat.ID, "Aktiv sessiya yo'q.")
+		return
+	}
+	if !sess.IsClaudeMode() {
+		b.reply(m.Chat.ID, "Claude rejimi yoqilmagan.")
+		return
+	}
+	sess.ExitClaudeMode()
 }
 
 // runShortcut shortcut'ni aktiv sessiyada bajaradi.
