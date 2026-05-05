@@ -57,6 +57,8 @@ type Session struct {
 	// Claude rejimi state
 	claudeMode      bool               // true bo'lsa har bir matn promptga aylanadi
 	claudeSessionID string             // claude-cli session_id (--resume uchun)
+	claudeBinary    string             // probe qilingan claude absolyut yo'li
+	claudePath      string             // probe qilingan PATH (claude/node bilan)
 	claudeCancel    context.CancelFunc // aktiv claude exec'ni uzish uchun
 }
 

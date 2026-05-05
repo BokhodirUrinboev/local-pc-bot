@@ -15,7 +15,6 @@ import (
 const (
 	claudeEditInterval = 1500 * time.Millisecond
 	claudeMaxWait      = 5 * time.Minute
-	claudeBinary       = "claude"
 )
 
 // IsClaudeMode aktiv Claude rejimini tekshiradi.
@@ -26,26 +25,75 @@ func (s *Session) IsClaudeMode() bool {
 }
 
 // EnterClaudeMode rejimga kiradi. Aktiv live shortcut bo'lsa to'xtatiladi.
+// PTY shell orqali `claude` binar yo'lini va PATH'ni probe qilib oladi —
+// alohida ssh exec sessiya non-interactive bo'lgani uchun .bashrc/.profile'dagi
+// PATH avtomatik yuklanmaydi va `claude` topilmaydi.
 func (s *Session) EnterClaudeMode() {
 	s.StopLive()
 
 	s.mu.Lock()
 	already := s.claudeMode
-	s.claudeMode = true
 	s.mu.Unlock()
-
 	if already {
 		return
 	}
 
+	binPath, pathEnv, err := s.probeClaudeEnv()
+	if err != nil {
+		text := "⚠️ Claude rejimini yoqib bo'lmadi: " + htmlEscape(err.Error()) + "\n\n" +
+			"Serverda <code>claude</code> CLI o'rnatilganligini tekshiring (<code>which claude</code>)."
+		msg := tgbotapi.NewMessage(s.ChatID, text)
+		msg.ParseMode = tgbotapi.ModeHTML
+		_, _ = s.bot.Send(msg)
+		return
+	}
+
+	s.mu.Lock()
+	s.claudeMode = true
+	s.claudeBinary = binPath
+	s.claudePath = pathEnv
+	s.mu.Unlock()
+
 	text := "🤖 <b>Claude rejimi yoqildi</b>\n\n" +
 		"Yozgan har bir xabaringiz <code>claude -p</code> orqali yuboriladi.\n" +
 		"Javob real vaqtda strim qilib bitta xabarda yangilanadi.\n\n" +
+		"<code>" + htmlEscape(binPath) + "</code>\n\n" +
 		"<i>Ctrl+C</i> — aktiv promptni uzish\n" +
 		"/endclaude — rejimdan chiqish"
 	msg := tgbotapi.NewMessage(s.ChatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	_, _ = s.bot.Send(msg)
+}
+
+// probeClaudeEnv mavjud PTY shell orqali `claude` absolyut yo'lini va
+// $PATH'ni topadi. Toza chiqish uchun `printf` BIN:/PATH: prefikslari ishlatiladi.
+// runOnceLocked cmdMu'ni o'zi oladi, shuning uchun bu funksiya cmdMu ushlamasligi kerak.
+func (s *Session) probeClaudeEnv() (string, string, error) {
+	cmd := `printf 'BIN:%s\n' "$(command -v claude 2>/dev/null)"; printf 'PATH:%s\n' "$PATH"`
+
+	out, ok := s.runOnceLocked(cmd)
+	if !ok {
+		return "", "", fmt.Errorf("sessiya yopilgan")
+	}
+	text := stripANSI(string(out))
+
+	var binPath, pathEnv string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if v, found := strings.CutPrefix(line, "BIN:"); found {
+			if v != "" && binPath == "" {
+				binPath = v
+			}
+		} else if v, found := strings.CutPrefix(line, "PATH:"); found {
+			if v != "" && pathEnv == "" {
+				pathEnv = v
+			}
+		}
+	}
+	if binPath == "" {
+		return "", "", fmt.Errorf("`claude` PATH'da topilmadi")
+	}
+	return binPath, pathEnv, nil
 }
 
 // ExitClaudeMode rejimdan chiqadi va sessiya idsini tozalaydi (keyingi /claude
@@ -55,6 +103,8 @@ func (s *Session) ExitClaudeMode() {
 	was := s.claudeMode
 	s.claudeMode = false
 	s.claudeSessionID = ""
+	s.claudeBinary = ""
+	s.claudePath = ""
 	cancel := s.claudeCancel
 	s.claudeCancel = nil
 	s.mu.Unlock()
@@ -85,9 +135,17 @@ func (s *Session) RunClaude(prompt string) {
 
 	s.mu.Lock()
 	sessionID := s.claudeSessionID
+	binary := s.claudeBinary
+	pathEnv := s.claudePath
 	s.mu.Unlock()
 
-	cmd := buildClaudeCmd(prompt, sessionID)
+	if binary == "" {
+		// Holat: kimdir EnterClaudeMode'siz to'g'ridan to'g'ri RunClaude chaqirgan.
+		s.replyError("Claude binari probe qilinmagan. /claude komandasini qayta yuboring.")
+		return
+	}
+
+	cmd := buildClaudeCmd(binary, pathEnv, prompt, sessionID)
 
 	placeholder := tgbotapi.NewMessage(s.ChatID, "🤖 <i>Claude o'ylayapti…</i>")
 	placeholder.ParseMode = tgbotapi.ModeHTML
@@ -194,9 +252,16 @@ func (s *Session) RunClaude(prompt string) {
 	}
 }
 
-func buildClaudeCmd(prompt, sessionID string) string {
+// buildClaudeCmd absolyut binar yo'li va probed PATH bilan komanda quradi.
+// PATH explicit beriladi — claude shebang orqali node'ni env'dan topadi.
+func buildClaudeCmd(binary, pathEnv, prompt, sessionID string) string {
 	var sb strings.Builder
-	sb.WriteString(claudeBinary)
+	if pathEnv != "" {
+		sb.WriteString("PATH=")
+		sb.WriteString(shellSingleQuote(pathEnv))
+		sb.WriteString(" ")
+	}
+	sb.WriteString(shellSingleQuote(binary))
 	sb.WriteString(" -p ")
 	sb.WriteString(shellSingleQuote(prompt))
 	sb.WriteString(" --output-format stream-json --include-partial-messages --verbose")
