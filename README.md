@@ -1,103 +1,89 @@
-# Remofy Telegram Bot
+# Remofy local bot
 
-[Remofy web-ssh](../web-ssh-backend) ning Telegram bot versiyasi. Foydalanuvchi brauzersiz, to'g'ridan-to'g'ri Telegram orqali o'z serverlariga ulanib komandalar bajara oladi.
-
-Bot mavjud Remofy ma'lumotlar bazasini (PostgreSQL) o'qiydi — foydalanuvchi web-ssh saytida qo'shgan serverlar avtomatik ko'rinadi. O'zining `telegram_users` jadvalini qo'shadi (Telegram ↔ web-ssh foydalanuvchi bog'lanishi).
+Shu kompyuterda ishlovchi Telegram bot. Whitelist'dagi foydalanuvchilarga
+Telegram orqali to'g'ridan-to'g'ri PowerShell komandalari va Claude'ni ishlatishga ruxsat beradi.
 
 ## Xususiyatlar
 
-- **Google OAuth bog'lanish:** `/start` → link bosib Google'da kirish → Telegram ID web-ssh foydalanuvchisi bilan bog'lanadi
-- **Davomiy SSH sessiyasi:** har bir komanda bir xil shellda bajariladi (`cd`, env, history saqlanadi)
-- **Live output:** SSH chiqishi bitta xabarda yangilanib turadi (anchor message + edit-throttle)
-- **Maxsus tugmalar:** Ctrl+C, Tab, Enter, ↑↓, Esc, Disconnect — inline keyboard orqali
-- **Xom baytlar:** `/raw <hex>` — istalgan kontrol kodlarni yuborish
-- **Auto-disconnect:** 30 daqiqa bo'sh tursa sessiya yopiladi
-- **Keepalive:** SSH `keepalive@openssh.com` har 30 sek (uzoq sessiyalar uzilib qolmasligi uchun)
-- **Claude rejimi:** `/claude` — serverdagi `claude` CLI bilan real-time AI suhbat (`claude -p --output-format stream-json --include-partial-messages`); javob bitta xabarda strim qilib yangilanadi, suhbat konteksti `--resume` orqali saqlanadi. `Ctrl+C` aktiv promptni uzadi, `/endclaude` rejimdan chiqaradi.
+- **Local PowerShell:** har qanday matn → `powershell.exe -Command ...` orqali bajariladi
+- **Persistent CWD:** `cd` komandasi keyingi komandalar uchun ham saqlanadi
+- **Live output:** uzoq ishlaydigan komandalar Telegram xabarini real vaqtda yangilaydi
+- **Claude rejimi:** local `claude` CLI bilan strim qilinadigan suhbat (`--resume` orqali kontekst saqlanadi)
+- **Whitelist:** faqat ruxsat etilgan Telegram ID'lar foydalana oladi (`ALLOWED_TELEGRAM_IDS`)
+- **Stop tugmasi:** aktiv komanda yoki Claude promptini Telegramdan to'xtatish
+- **Server sifatida:** Task Scheduler orqali boot'da avtomatik ishga tushadi, crash bo'lsa qayta ishga tushadi
 
-## Sozlash
+## Sozlash (lokal)
 
-### 1. `.env`
+```powershell
+# 1. .env yarating
+Copy-Item .env.example .env
+notepad .env
+# TELEGRAM_BOT_TOKEN va ALLOWED_TELEGRAM_IDS to'ldiring
 
-```bash
-cp .env.example .env
+# 2. Build
+$env:GOOS='windows'; $env:GOARCH='amd64'
+go build -ldflags='-s -w' -o '.dist\remofy-bot.exe' .\cmd\bot
+
+# 3. Sinov uchun ishga tushirish
+.\.dist\remofy-bot.exe
 ```
 
-To'ldirilishi kerak:
+## Server sifatida o'rnatish (boot'da auto-start)
 
-| Kalit | Tavsif |
-|-------|--------|
-| `DB_PATH` | Web-ssh-backend ishlatadigan **bir xil** Postgres DSN |
-| `ENCRYPTION_KEY` | Web-ssh dagi **bir xil** 32-baytli kalit (server parollarini decrypt qilish uchun) |
-| `TELEGRAM_BOT_TOKEN` | [@BotFather](https://t.me/BotFather) dan olingan token |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth Client (yangi yoki mavjudini ishlatish mumkin) |
-| `GOOGLE_REDIRECT_URL` | `https://<bot-host>/auth/google/callback` — Google Cloud konsolida ham ro'yxatdan o'tgan bo'lishi shart |
-| `PUBLIC_BASE_URL` | Botning ommaviy URL'i (bot foydalanuvchiga login linkini shu asosda yuboradi) |
-| `BOT_HTTP_PORT` | OAuth callback uchun port (default `8090`) |
-| `SESSION_IDLE_MINUTES` | Sessiya idle timeout (default `30`) |
+`scripts/install.ps1` Administrator PowerShell ostida ishlatiladi. Batafsil: [scripts/README.md](scripts/README.md).
 
-> ⚠️ `ENCRYPTION_KEY` web-ssh-backend dagi qiymat bilan **aynan bir xil** bo'lishi shart. Aks holda mavjud serverlarning parollari decrypt qilinmaydi.
-
-### 2. Google OAuth
-
-Google Cloud Console'da OAuth Client'ga **Authorized redirect URI** sifatida `${PUBLIC_BASE_URL}/auth/google/callback` qo'shing.
-
-Web-ssh bilan bir xil clientdan foydalanish mumkin — faqat ikkita redirect URI bo'ladi (web-ssh va bot uchun).
-
-## Ishga tushirish
-
-### Lokal
-
-```bash
-go mod download
-go run ./cmd/bot
+```powershell
+# Administrator PowerShell:
+.\scripts\install.ps1
 ```
 
-`PUBLIC_BASE_URL` lokalda — Telegramdan callback uchun publik URL kerak. [ngrok](https://ngrok.com) yoki shunga o'xshash tunnel ishlating:
+Bu quyidagilarni qiladi:
+- `C:\ProgramData\remofy-bot\` ga fayllarni o'rnatadi
+- AC quvvatda hech qachon uxlamasin deb power planni o'zgartiradi
+- LocalSystem ostida `RemofyBot` Task Scheduler taskini yaratadi (boot'da auto-start, crash → restart)
+- Botni darhol ishga tushiradi
 
-```bash
-ngrok http 8090
-# ngrok URL ni .env dagi PUBLIC_BASE_URL va GOOGLE_REDIRECT_URL ga yozing
-```
+## Komandalar
 
-### Docker
+| Komanda | Tavsif |
+|---------|--------|
+| `/start`, `/help` | Yordam + joriy CWD |
+| `/pwd` | Joriy ish papkasi |
+| `/cd <path>` | Papkani o'zgartirish (state saqlanadi) |
+| `/stop` | Aktiv komandani uzish (Ctrl+C analog) |
+| `/claude` | Claude rejimini yoqish |
+| `/claude <savol>` | Bir martalik prompt yuborish |
+| `/endclaude` | Claude rejimidan chiqish |
+| (boshqa matn) | PowerShell komandasi sifatida bajariladi |
 
-```bash
-docker build -t remofy-bot .
-docker run -d --env-file .env -p 8090:8090 remofy-bot
-```
+## Konfiguratsiya
 
-## Foydalanish
-
-1. Telegramda botga `/start` yozing
-2. "🔐 Google bilan kirish" tugmasini bosing → Google'da kirib chiqing
-3. Botga qaytib `/servers` yozing — web-ssh dagi serverlar tugmalar shaklida ko'rinadi
-4. Tugma bosing yoki `/connect <id>` — ulanish ochiladi
-5. Komanda yozing — output anchor xabarda yangilanib turadi
-6. `/disconnect` — sessiyani yopish
+| Env var | Tavsif |
+|---------|--------|
+| `TELEGRAM_BOT_TOKEN` | [@BotFather](https://t.me/BotFather)'dan olingan token (majburiy) |
+| `ALLOWED_TELEGRAM_IDS` | Ruxsat etilgan Telegram ID'lar (vergul bilan). Bo'sh — hamma uchun ochiq (xavfli) |
+| `BOT_WORKDIR` | Default ish papkasi. Bo'sh — `C:\Users\nbkab\OneDrive\Ishchi stol` |
 
 ## Cheklovlar
 
-- **Interaktiv TUI:** `vim`, `nano`, `htop` — ANSI cursor manipulyatsiyasi Telegramda to'g'ri ko'rinmaydi. Oddiy `cat`, `tail -f`, `top -bn1` ishlaydi.
-- **Edit rate limit:** juda tez chiqadigan output (masalan `yes`) — Telegram rate limiti tufayli to'liq ko'rinmasligi mumkin (debounce bilan tushib qoladi).
-- **Bir foydalanuvchi = bir sessiya:** yangi `/connect` eskisini yopadi.
-- **In-memory store:** bot qayta ishga tushganda barcha sessiyalar yo'qoladi — qayta ulanish kerak.
+- **Interaktiv komandalar yo'q:** `python` REPL, `vim`, `nano` kabi stdin kutadigan dasturlar 30 daqiqada timeout bo'ladi
+- **Bitta komanda bir vaqtda:** har bir foydalanuvchi uchun komandalar ketma-ket bajariladi (oldingisi tugamaguncha keyingisi kutadi). `/stop` orqali aktiv'ini uzish mumkin
+- **In-memory state:** bot qayta ishga tushganda har bir foydalanuvchining CWD'si default'ga qaytadi (Claude session ID ham yo'qoladi)
 
 ## Arxitektura
 
 ```
 remofy-bot/
-├── cmd/bot/main.go              # Entry: bot polling + OAuth HTTP server
-├── internal/
-│   ├── bot/
-│   │   ├── handler.go           # Update dispatcher + komandalar
-│   │   ├── session.go           # Per-user SSH sessiya managerи
-│   │   └── output.go            # Ring buffer, ANSI strip, HTML escape
-│   ├── auth/
-│   │   ├── oauth.go             # Google OAuth handlers
-│   │   └── link.go              # State token → TelegramID linking
-│   ├── db/db.go                 # GORM + TelegramUser AutoMigrate
-│   ├── models/                  # User, Server, Folder (web-ssh sxemasi) + TelegramUser
-│   ├── crypto/crypto.go         # AES-GCM (web-ssh bilan bir xil)
-│   └── sshconn/connect.go       # SSH dial + PTY + keepalive
+├── cmd/bot/main.go           # Entry: env + Telegram polling
+├── internal/bot/
+│   ├── handler.go            # Update dispatcher, whitelist, komandalar
+│   ├── session.go            # Per-user CWD + RunCommand (PowerShell exec)
+│   ├── claude.go             # Local claude -p stream-json parser
+│   └── output.go             # ANSI strip, HTML escape
+└── scripts/                  # Windows install (Task Scheduler)
+    ├── install.ps1
+    ├── uninstall.ps1
+    ├── run-bot.ps1
+    └── README.md
 ```

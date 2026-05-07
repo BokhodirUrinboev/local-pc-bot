@@ -3,17 +3,13 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
-	"time"
 
-	"remofy-bot/internal/auth"
 	"remofy-bot/internal/bot"
-	"remofy-bot/internal/crypto"
-	"remofy-bot/internal/db"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
@@ -21,72 +17,43 @@ import (
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found (using process env)")
+		log.Println("No .env file (process env'dan foydalanyapmiz)")
 	}
 
 	token := mustEnv("TELEGRAM_BOT_TOKEN")
-	publicURL := mustEnv("PUBLIC_BASE_URL")
-	httpPort := os.Getenv("BOT_HTTP_PORT")
-	if httpPort == "" {
-		httpPort = "8090"
+	workdir := strings.TrimSpace(os.Getenv("BOT_WORKDIR"))
+	if workdir == "" {
+		workdir = `C:\Users\nbkab\OneDrive\Ishchi stol`
 	}
-
-	idleMin, _ := strconv.Atoi(os.Getenv("SESSION_IDLE_MINUTES"))
-	idleTimeout := time.Duration(idleMin) * time.Minute
-
-	db.Init()
-	crypto.Init()
 
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
-		log.Fatalf("Failed to init Telegram bot: %v", err)
+		log.Fatalf("Telegram init: %v", err)
 	}
-	log.Printf("Authorized on bot: @%s", api.Self.UserName)
+	log.Printf("Bot: @%s", api.Self.UserName)
 
-	rootCtx, rootCancel := context.WithCancel(context.Background())
-	defer rootCancel()
-
-	mgr := bot.NewManager(api, idleTimeout)
-	b := bot.New(api, mgr, publicURL, rootCtx)
-
-	auth.Init(b.OnLinked)
-	auth.StartGC()
-
-	// Telegram slash menyusiga komandalarni registratsiya qilish
-	if _, err := api.Request(tgbotapi.NewSetMyCommands(bot.BotCommands()...)); err != nil {
-		log.Printf("setMyCommands failed: %v", err)
+	allowedIDs := parseAllowedIDs(os.Getenv("ALLOWED_TELEGRAM_IDS"))
+	if len(allowedIDs) == 0 {
+		log.Println("WARNING: ALLOWED_TELEGRAM_IDS bo'sh — bot HAMMA uchun ochiq!")
 	} else {
-		log.Println("Bot commands registered")
+		log.Printf("Whitelist (%d): %v", len(allowedIDs), allowedIDs)
 	}
 
-	// Menu button'ni default'ga qaytarish (avval web_app o'rnatilgan bo'lishi mumkin —
-	// endi slash komandalar menyusi ko'rinishini xohlaymiz).
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := bot.NewManager(api, workdir)
+	b := bot.New(api, mgr, allowedIDs, rootCtx)
+
+	if _, err := api.Request(tgbotapi.NewSetMyCommands(bot.BotCommands()...)); err != nil {
+		log.Printf("setMyCommands: %v", err)
+	}
 	if _, err := api.MakeRequest("setChatMenuButton", tgbotapi.Params{
 		"menu_button": `{"type":"commands"}`,
 	}); err != nil {
-		log.Printf("reset menu button failed: %v", err)
+		log.Printf("setChatMenuButton: %v", err)
 	}
 
-	// HTTP server (OAuth callback)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/auth/google/login", auth.HandleLogin)
-	mux.HandleFunc("/auth/google/callback", auth.HandleCallback)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
-	httpSrv := &http.Server{
-		Addr:              ":" + httpPort,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() {
-		log.Printf("HTTP server listening on :%s", httpPort)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
-		}
-	}()
-
-	// Bot long polling
 	uCfg := tgbotapi.NewUpdate(0)
 	uCfg.Timeout = 30
 	updates := api.GetUpdatesChan(uCfg)
@@ -95,7 +62,6 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	log.Println("Bot ishga tushdi. Ctrl+C — to'xtatish.")
-
 	for {
 		select {
 		case u := <-updates:
@@ -103,10 +69,7 @@ func main() {
 		case <-stop:
 			log.Println("Shutdown signal — to'xtatilmoqda...")
 			api.StopReceivingUpdates()
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = httpSrv.Shutdown(shutdownCtx)
 			cancel()
-			rootCancel()
 			return
 		}
 	}
@@ -115,7 +78,30 @@ func main() {
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
-		log.Fatalf("%s is required", key)
+		log.Fatalf("%s required", key)
 	}
 	return v
+}
+
+// parseAllowedIDs vergul/probel bilan ajratilgan Telegram ID ro'yxatini parslaydi.
+func parseAllowedIDs(raw string) []int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	sep := func(r rune) bool { return r == ',' || r == ' ' || r == ';' || r == '\t' }
+	out := make([]int64, 0, 4)
+	for _, p := range strings.FieldsFunc(raw, sep) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(p, 10, 64)
+		if err != nil {
+			log.Printf("ALLOWED_TELEGRAM_IDS: yaroqsiz '%s'", p)
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }

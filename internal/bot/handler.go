@@ -2,456 +2,159 @@ package bot
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 
-	"remofy-bot/internal/auth"
-	"remofy-bot/internal/db"
-	"remofy-bot/internal/models"
-
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"gorm.io/gorm"
 )
 
 type Bot struct {
-	API         *tgbotapi.BotAPI
-	Mgr         *Manager
-	PublicURL   string
-	rootContext context.Context
+	API        *tgbotapi.BotAPI
+	Mgr        *Manager
+	rootCtx    context.Context
+	allowedIDs map[int64]struct{} // bo'sh bo'lsa — hamma uchun ochiq
 }
 
-func New(api *tgbotapi.BotAPI, mgr *Manager, publicURL string, ctx context.Context) *Bot {
-	return &Bot{
-		API:         api,
-		Mgr:         mgr,
-		PublicURL:   strings.TrimRight(publicURL, "/"),
-		rootContext: ctx,
+func New(api *tgbotapi.BotAPI, mgr *Manager, allowedIDs []int64, ctx context.Context) *Bot {
+	allow := make(map[int64]struct{}, len(allowedIDs))
+	for _, id := range allowedIDs {
+		allow[id] = struct{}{}
 	}
+	return &Bot{API: api, Mgr: mgr, rootCtx: ctx, allowedIDs: allow}
 }
 
-// shortcutSpec — slash komanda spetsifikatsiyasi.
-type shortcutSpec struct {
-	cmd  string
-	live bool // true bo'lsa — bitta xabarni davriy yangilab turadi (auto-update)
+func (b *Bot) isAllowed(tgID int64) bool {
+	if len(b.allowedIDs) == 0 {
+		return true
+	}
+	_, ok := b.allowedIDs[tgID]
+	return ok
 }
 
-// shellShortcuts — slash komanda → aktiv sessiyada ishlatiladigan shell buyrug'i.
-// Hammasi NON-INTERACTIVE — Telegram chat sharoitida snapshot beradi.
-// `live: true` — har 2 sekundda yangilanadigan jonli xabar (Stop tugmasi bilan).
-var shellShortcuts = map[string]shortcutSpec{
-	"htop":   {"top -bn1 -o %MEM | head -30", true},
-	"top":    {"top -bn1 -o %MEM | head -30", true},
-	"free":   {"free -h", true},
-	"mem":    {"free -h", true},
-	"uptime": {"uptime", true},
-	"disk":   {"df -h", false},
-	"df":     {"df -h", false},
-	"ps":     {"ps auxf | head -30", false},
-	"who":    {"who", false},
-	"ip":     {"ip -br a", false},
-	"date":   {"date", false},
-}
+const btnStop = "⏹ Stop"
 
-// BotCommands Telegram'ning slash menyusiga registratsiya qilinadigan komandalar.
+// BotCommands — Telegram menyusi uchun.
 func BotCommands() []tgbotapi.BotCommand {
 	return []tgbotapi.BotCommand{
-		{Command: "start", Description: "Botni ishga tushirish / bog'lanish"},
-		{Command: "servers", Description: "Server ro'yxati"},
-		{Command: "connect", Description: "Serverga ulanish (id bilan)"},
-		{Command: "disconnect", Description: "Sessiyani yopish"},
-		{Command: "uptime", Description: "Server uptime"},
-		{Command: "disk", Description: "Disk: df -h"},
-		{Command: "free", Description: "Xotira: free -h"},
-		{Command: "ps", Description: "Jarayonlar (top 30)"},
-		{Command: "htop", Description: "Top snapshot (top -bn1)"},
-		{Command: "who", Description: "Tizimga kirgan foydalanuvchilar"},
-		{Command: "ip", Description: "IP manzillar (ip -br a)"},
-		{Command: "raw", Description: "Xom baytlar yuborish (hex)"},
-		{Command: "claude", Description: "Claude rejimi (real-time AI suhbat)"},
-		{Command: "endclaude", Description: "Claude rejimidan chiqish"},
+		{Command: "start", Description: "Boshlash / yordam"},
 		{Command: "help", Description: "Yordam"},
+		{Command: "pwd", Description: "Joriy papka"},
+		{Command: "cd", Description: "Papkani o'zgartirish"},
+		{Command: "stop", Description: "Aktiv komandani to'xtatish"},
+		{Command: "claude", Description: "Claude rejimi"},
+		{Command: "endclaude", Description: "Claude rejimidan chiqish"},
 	}
 }
 
-// keyButtons — reply keyboard'dagi tugma label'lari → SSH stdin'ga yoziladigan raw kodlar.
-var keyButtons = map[string]string{
-	"Tab":   "\t",
-	"Enter": "\n",
-	"↑":     "\x1b[A",
-	"↓":     "\x1b[B",
-	"Esc":   "\x1b",
-}
-
-const (
-	btnInterrupt  = "Ctrl+C"
-	btnDisconnect = "🔌 Disconnect"
-)
-
-// OnLinked — auth paketi tomonidan OAuth callback muvaffaqiyatli bo'lganda chaqiriladi.
-func (b *Bot) OnLinked(telegramID int64, user models.User) {
-	msg := tgbotapi.NewMessage(telegramID, fmt.Sprintf("✅ Bog'landi: <b>%s</b>\n\n/servers — server ro'yxati", htmlEscape(user.Email)))
-	msg.ParseMode = tgbotapi.ModeHTML
-	if _, err := b.API.Send(msg); err != nil {
-		log.Printf("OnLinked send: %v", err)
-	}
+func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	kb := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(btnStop),
+		),
+	)
+	kb.ResizeKeyboard = true
+	return kb
 }
 
 // HandleUpdate har bir Telegram yangilanishini qabul qiladi.
 func (b *Bot) HandleUpdate(u tgbotapi.Update) {
-	switch {
-	case u.CallbackQuery != nil:
-		b.handleCallback(u.CallbackQuery)
-	case u.Message != nil:
-		b.handleMessage(u.Message)
-	}
-}
-
-func (b *Bot) handleMessage(m *tgbotapi.Message) {
-	if m.From == nil {
+	// Faqat Message — callback'lar yo'q endi
+	if u.Message == nil || u.Message.From == nil {
 		return
 	}
-	tgID := m.From.ID
+	m := u.Message
+	fromID := m.From.ID
+	chatID := m.Chat.ID
+
+	// Whitelist gate
+	if !b.isAllowed(fromID) {
+		log.Printf("denied (not in whitelist): tg_id=%d", fromID)
+		text := fmt.Sprintf("⛔ Sizga ushbu botdan foydalanishga ruxsat berilmagan.\n\nTelegram ID: <code>%d</code>", fromID)
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ParseMode = tgbotapi.ModeHTML
+		_, _ = b.API.Send(msg)
+		return
+	}
+
+	sess := b.Mgr.Get(fromID, chatID)
 
 	if m.IsCommand() {
-		cmd := m.Command()
-		// Shell shortcut'lar — aktiv sessiyada mos shell buyrug'ini bajaradi
-		if spec, ok := shellShortcuts[cmd]; ok {
-			b.runShortcut(m, spec)
-			return
-		}
-		switch cmd {
-		case "start":
-			b.cmdStart(m)
-		case "help":
-			b.cmdHelp(m)
-		case "servers":
-			b.cmdServers(m)
-		case "connect":
-			b.cmdConnect(m)
-		case "disconnect":
-			b.cmdDisconnect(m)
-		case "raw":
-			b.cmdRaw(m)
+		switch m.Command() {
+		case "start", "help":
+			b.cmdHelp(sess)
+		case "pwd":
+			b.reply(sess, "📂 <code>"+htmlEscape(sess.Cwd())+"</code>")
+		case "cd":
+			args := strings.TrimSpace(m.CommandArguments())
+			if args == "" {
+				b.reply(sess, "📂 <code>"+htmlEscape(sess.Cwd())+"</code>\n<i>Ishlatish: /cd &lt;path&gt;</i>")
+				return
+			}
+			go sess.RunCommand("Set-Location -LiteralPath " + psQuote(args))
+		case "stop":
+			sess.SendInterrupt()
+			b.reply(sess, "⏹ Stop signal yuborildi.")
 		case "claude":
-			b.cmdClaude(m)
+			args := strings.TrimSpace(m.CommandArguments())
+			if !sess.IsClaudeMode() {
+				sess.EnterClaudeMode()
+			}
+			if args != "" {
+				go sess.RunClaude(args)
+			}
 		case "endclaude":
-			b.cmdEndClaude(m)
+			sess.ExitClaudeMode()
 		default:
-			b.reply(m.Chat.ID, "Noma'lum komanda. /help")
+			b.reply(sess, "Noma'lum komanda. /help")
 		}
-		return
-	}
-
-	sess := b.Mgr.Get(tgID)
-	if sess == nil {
-		b.reply(m.Chat.ID, "Aktiv sessiya yo'q. /servers ro'yxatdan tanlang yoki /connect <id>")
 		return
 	}
 
 	text := m.Text
-
-	// Reply keyboard tugmalari (Ctrl+C / Disconnect Claude rejimida ham ishlaydi)
-	switch text {
-	case btnDisconnect:
-		sess.Close("foydalanuvchi tomonidan uzildi")
-		b.Mgr.Remove(tgID)
-		return
-	case btnInterrupt:
-		sess.StopLive() // Ctrl+C aktiv live monitoring'ni ham to'xtatadi
+	if text == btnStop {
 		sess.SendInterrupt()
 		return
 	}
 
-	// Claude rejimi: maxsus tugmalardan tashqari hamma matn promptga aylanadi
+	// Claude rejimi: matn → prompt
 	if sess.IsClaudeMode() {
 		go sess.RunClaude(text)
 		return
 	}
 
-	switch text {
-	case "Esc":
-		sess.StopLive() // Esc — "cancel" semantikasi: live'ni to'xtatadi
-		go sess.SendKey(keyButtons["Esc"])
-		return
-	}
-	if raw, ok := keyButtons[text]; ok {
-		go sess.SendKey(raw)
-		return
-	}
-
-	// Oddiy komanda
+	// Oddiy PowerShell komandasi
 	go sess.RunCommand(text)
 }
 
-func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
-	defer func() {
-		_, _ = b.API.Request(tgbotapi.NewCallback(cb.ID, ""))
-	}()
+func (b *Bot) cmdHelp(s *Session) {
+	text := `<b>Remofy bot</b> — shu kompyuterda terminal va Claude.
 
-	if cb.From == nil || cb.Message == nil {
-		return
-	}
-	data := cb.Data
+<b>Foydalanish:</b>
+• Har qanday matn → PowerShell komandasi
+• <code>cd ...</code> ishlatsangiz — papka holati saqlanadi (keyingi komandalar shu papkadan)
+• Long-running komandani <b>⏹ Stop</b> tugma orqali to'xtatish mumkin
 
-	switch {
-	case strings.HasPrefix(data, "connect:"):
-		idStr := strings.TrimPrefix(data, "connect:")
-		serverID, err := strconv.ParseUint(idStr, 10, 64)
-		if err != nil {
-			return
-		}
-		b.connectByID(cb.From.ID, cb.Message.Chat.ID, uint(serverID))
-
-	case data == "live:stop":
-		if sess := b.Mgr.Get(cb.From.ID); sess != nil {
-			sess.StopLive()
-		}
-	}
-}
-
-// --- Komandalar ---
-
-func (b *Bot) cmdStart(m *tgbotapi.Message) {
-	tgID := m.From.ID
-	user, ok := b.lookupUser(tgID)
-	if ok {
-		text := fmt.Sprintf("Salom, <b>%s</b>!\n\n/servers — serverlar ro'yxati\n/help — yordam", htmlEscape(user.Email))
-		b.reply(m.Chat.ID, text)
-		return
-	}
-
-	state := auth.NewLinkToken(tgID, m.From.UserName)
-	url := fmt.Sprintf("%s/auth/google/login?state=%s", b.PublicURL, state)
-	text := "👋 Remofy botiga xush kelibsiz!\n\nBoshlash uchun Google akkaunti bilan bog'laning. Link 10 daqiqa amal qiladi:"
-	msg := tgbotapi.NewMessage(m.Chat.ID, text)
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonURL("🔐 Google bilan kirish", url),
-		),
-	)
-	if _, err := b.API.Send(msg); err != nil {
-		log.Printf("cmdStart send: %v", err)
-	}
-}
-
-func (b *Bot) cmdHelp(m *tgbotapi.Message) {
-	text := `<b>Remofy bot — komandalar</b>
-
-<b>Sessiya:</b>
-/start — bog'lanish (Google)
-/servers — server ro'yxati
-/connect &lt;id&gt; — serverga ulanish
-/disconnect — sessiyani yopish
-
-<b>Tezkor shell snapshotlar (aktiv sessiya kerak):</b>
-🔴 <i>Live (auto-update har 2 sek, max 3 daq)</i>:
-/htop yoki /top — top -bn1
-/free yoki /mem — free -h
-/uptime — uptime
-
-📸 <i>Bir martalik snapshot</i>:
-/disk yoki /df — df -h
-/ps — ps auxf | head -30
-/who — kirgan foydalanuvchilar
-/ip — IP manzillar
-/date — joriy vaqt
-
-<b>🤖 Claude (real-time AI):</b>
-/claude — Claude rejimini yoqish (har bir xabar promptga aylanadi, javob strim qilinadi)
+<b>Komandalar:</b>
+/pwd — joriy papka
+/cd &lt;path&gt; — papkani o'zgartirish
+/stop — aktiv komandani uzish
+/claude — Claude rejimini yoqish (matn → prompt)
 /claude &lt;savol&gt; — bitta promptni darhol yuborish
-/endclaude — rejimdan chiqish
-<i>Server tomonida <code>claude</code> CLI o'rnatilgan bo'lishi shart. Aktiv promptni Ctrl+C orqali uzish mumkin.</i>
+/endclaude — Claude rejimidan chiqish
 
-<b>Boshqa:</b>
-/raw &lt;hex&gt; — xom baytlar (masalan "1b5b41" = ↑)
-/help — shu yordam
+<b>Joriy papka:</b> <code>` + htmlEscape(s.Cwd()) + `</code>`
 
-<b>Sessiya ichida:</b>
-• Har qanday matn — komanda sifatida yuboriladi
-• Har komanda uchun alohida javob keladi
-• Pastdagi tugmalar: Ctrl+C, Tab, Enter, ↑↓, Esc, Disconnect
-
-<b>Cheklov:</b> vim/htop/nano kabi to'liq ekranli (TUI) dasturlar avtomatik to'xtatiladi — snapshot uchun yuqoridagi shortcut'lardan foydalaning.`
-	b.reply(m.Chat.ID, text)
+	msg := tgbotapi.NewMessage(s.ChatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.ReplyMarkup = mainKeyboard()
+	_, _ = b.API.Send(msg)
 }
 
-func (b *Bot) cmdServers(m *tgbotapi.Message) {
-	user, ok := b.lookupUser(m.From.ID)
-	if !ok {
-		b.cmdStart(m)
-		return
-	}
-	var servers []models.Server
-	if err := db.DB.Where("user_id = ?", user.ID).Order("name").Find(&servers).Error; err != nil {
-		b.reply(m.Chat.ID, "DB xato: "+err.Error())
-		return
-	}
-	if len(servers) == 0 {
-		b.reply(m.Chat.ID, "Sizda hali server yo'q. Web-ssh saytida server qo'shing.")
-		return
-	}
-
-	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(servers))
-	for _, s := range servers {
-		label := fmt.Sprintf("%s (%s@%s)", s.Name, s.Username, s.Host)
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("connect:%d", s.ID)),
-		))
-	}
-
-	msg := tgbotapi.NewMessage(m.Chat.ID, fmt.Sprintf("Sizning serverlaringiz (%d):", len(servers)))
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-	if _, err := b.API.Send(msg); err != nil {
-		log.Printf("cmdServers send: %v", err)
-	}
-}
-
-func (b *Bot) cmdConnect(m *tgbotapi.Message) {
-	user, ok := b.lookupUser(m.From.ID)
-	if !ok {
-		b.cmdStart(m)
-		return
-	}
-	args := strings.TrimSpace(m.CommandArguments())
-	if args == "" {
-		b.reply(m.Chat.ID, "Ishlatish: /connect &lt;server_id&gt;\n\nServer IDsini /servers dan oling.")
-		return
-	}
-	id, err := strconv.ParseUint(args, 10, 64)
-	if err != nil {
-		b.reply(m.Chat.ID, "ID raqam bo'lishi kerak.")
-		return
-	}
-	_ = user
-	b.connectByID(m.From.ID, m.Chat.ID, uint(id))
-}
-
-func (b *Bot) cmdDisconnect(m *tgbotapi.Message) {
-	sess := b.Mgr.Get(m.From.ID)
-	if sess == nil {
-		b.reply(m.Chat.ID, "Aktiv sessiya yo'q.")
-		return
-	}
-	sess.Close("foydalanuvchi tomonidan uzildi")
-	b.Mgr.Remove(m.From.ID)
-}
-
-func (b *Bot) cmdRaw(m *tgbotapi.Message) {
-	sess := b.Mgr.Get(m.From.ID)
-	if sess == nil {
-		b.reply(m.Chat.ID, "Aktiv sessiya yo'q.")
-		return
-	}
-	hexStr := strings.ReplaceAll(strings.TrimSpace(m.CommandArguments()), " ", "")
-	if hexStr == "" {
-		b.reply(m.Chat.ID, "Ishlatish: /raw 1b5b41  (= Up arrow)")
-		return
-	}
-	if len(hexStr)%2 != 0 {
-		b.reply(m.Chat.ID, "Hex satr juft uzunlikda bo'lishi kerak.")
-		return
-	}
-	bytes := make([]byte, len(hexStr)/2)
-	for i := 0; i < len(bytes); i++ {
-		v, err := strconv.ParseUint(hexStr[i*2:i*2+2], 16, 8)
-		if err != nil {
-			b.reply(m.Chat.ID, "Yaroqsiz hex: "+err.Error())
-			return
-		}
-		bytes[i] = byte(v)
-	}
-	go sess.SendKey(string(bytes))
-}
-
-// cmdClaude — Claude rejimini yoqadi yoki argument bilan birga bitta promptni
-// darhol yuboradi (rejim ham yoqiladi).
-func (b *Bot) cmdClaude(m *tgbotapi.Message) {
-	sess := b.Mgr.Get(m.From.ID)
-	if sess == nil {
-		b.reply(m.Chat.ID, "Aktiv sessiya yo'q. /servers ro'yxatdan tanlang.")
-		return
-	}
-	args := strings.TrimSpace(m.CommandArguments())
-	if !sess.IsClaudeMode() {
-		sess.EnterClaudeMode()
-	}
-	if args != "" {
-		go sess.RunClaude(args)
-	}
-}
-
-// cmdEndClaude Claude rejimidan chiqadi va session ID'ni tozalaydi.
-func (b *Bot) cmdEndClaude(m *tgbotapi.Message) {
-	sess := b.Mgr.Get(m.From.ID)
-	if sess == nil {
-		b.reply(m.Chat.ID, "Aktiv sessiya yo'q.")
-		return
-	}
-	if !sess.IsClaudeMode() {
-		b.reply(m.Chat.ID, "Claude rejimi yoqilmagan.")
-		return
-	}
-	sess.ExitClaudeMode()
-}
-
-// runShortcut shortcut'ni aktiv sessiyada bajaradi.
-// spec.live=true bo'lsa — auto-update'li jonli xabar; aks holda one-shot snapshot.
-func (b *Bot) runShortcut(m *tgbotapi.Message, spec shortcutSpec) {
-	sess := b.Mgr.Get(m.From.ID)
-	if sess == nil {
-		b.reply(m.Chat.ID, "Aktiv sessiya yo'q. /servers ro'yxatdan tanlang.")
-		return
-	}
-	if spec.live {
-		go sess.StartLive(m.Chat.ID, spec.cmd)
-	} else {
-		go sess.RunCommand(spec.cmd)
-	}
-}
-
-// --- Yordamchi ---
-
-func (b *Bot) connectByID(tgID, chatID int64, serverID uint) {
-	user, ok := b.lookupUser(tgID)
-	if !ok {
-		b.reply(chatID, "Avval /start orqali bog'laning.")
-		return
-	}
-	var server models.Server
-	err := db.DB.Where("id = ? AND user_id = ?", serverID, user.ID).First(&server).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		b.reply(chatID, "Server topilmadi yoki sizga tegishli emas.")
-		return
-	}
-	if err != nil {
-		b.reply(chatID, "DB xato: "+err.Error())
-		return
-	}
-
-	if _, err := b.Mgr.Open(b.rootContext, tgID, chatID, server); err != nil {
-		b.reply(chatID, "Ulanish xato: "+err.Error())
-	}
-}
-
-func (b *Bot) lookupUser(tgID int64) (models.User, bool) {
-	var link models.TelegramUser
-	if err := db.DB.Where("telegram_id = ?", tgID).First(&link).Error; err != nil {
-		return models.User{}, false
-	}
-	var user models.User
-	if err := db.DB.First(&user, link.UserID).Error; err != nil {
-		return models.User{}, false
-	}
-	return user, true
-}
-
-func (b *Bot) reply(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
+func (b *Bot) reply(s *Session, text string) {
+	msg := tgbotapi.NewMessage(s.ChatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	if _, err := b.API.Send(msg); err != nil {
-		log.Printf("reply: %v", err)
+		log.Printf("reply (tg=%d): %v", s.TelegramID, err)
 	}
 }
