@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"os"
 	"regexp"
 	"strings"
 )
@@ -19,3 +20,8 @@ func stripANSI(s string) string {
 var htmlReplacer = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 
 func htmlEscape(s string) string { return htmlReplacer.Replace(s) }
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}

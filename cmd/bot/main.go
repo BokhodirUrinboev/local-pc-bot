@@ -30,20 +30,37 @@ func main() {
 	if err != nil {
 		log.Fatalf("Telegram init: %v", err)
 	}
-	log.Printf("Bot: @%s", api.Self.UserName)
+	log.Printf("Bot: @%s (id=%d)", api.Self.UserName, api.Self.ID)
+	log.Printf("Workdir: %s", workdir)
 
-	allowedIDs := parseAllowedIDs(os.Getenv("ALLOWED_TELEGRAM_IDS"))
-	if len(allowedIDs) == 0 {
-		log.Println("WARNING: ALLOWED_TELEGRAM_IDS bo'sh — bot HAMMA uchun ochiq!")
+	allowedUsers := parseIDList(os.Getenv("ALLOWED_TELEGRAM_IDS"), "ALLOWED_TELEGRAM_IDS")
+	allowedChats := parseIDList(os.Getenv("ALLOWED_CHAT_IDS"), "ALLOWED_CHAT_IDS")
+
+	if len(allowedUsers) == 0 {
+		log.Println("WARNING: ALLOWED_TELEGRAM_IDS bo'sh — bot HAMMA private foydalanuvchi uchun ochiq!")
 	} else {
-		log.Printf("Whitelist (%d): %v", len(allowedIDs), allowedIDs)
+		log.Printf("User whitelist (%d): %v", len(allowedUsers), allowedUsers)
+	}
+	if len(allowedChats) == 0 {
+		log.Println("INFO: ALLOWED_CHAT_IDS bo'sh — bot gruppalarda umuman javob bermaydi.")
+	} else {
+		log.Printf("Chat whitelist (%d): %v", len(allowedChats), allowedChats)
 	}
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	mgr := bot.NewManager(api, workdir)
-	b := bot.New(api, mgr, allowedIDs, rootCtx)
+	systemPrompt := strings.TrimSpace(os.Getenv("BOT_SYSTEM_PROMPT"))
+	if systemPrompt != "" {
+		preview := systemPrompt
+		if len(preview) > 80 {
+			preview = preview[:80] + "..."
+		}
+		log.Printf("System prompt: %s", preview)
+	}
+
+	mgr := bot.NewManager(api, workdir, systemPrompt)
+	b := bot.New(api, mgr, allowedUsers, allowedChats, rootCtx)
 
 	if _, err := api.Request(tgbotapi.NewSetMyCommands(bot.BotCommands()...)); err != nil {
 		log.Printf("setMyCommands: %v", err)
@@ -83,8 +100,8 @@ func mustEnv(key string) string {
 	return v
 }
 
-// parseAllowedIDs vergul/probel bilan ajratilgan Telegram ID ro'yxatini parslaydi.
-func parseAllowedIDs(raw string) []int64 {
+// parseIDList vergul/probel/nuqta-vergul bilan ajratilgan int64 ID ro'yxatini parslaydi.
+func parseIDList(raw, label string) []int64 {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
@@ -98,7 +115,7 @@ func parseAllowedIDs(raw string) []int64 {
 		}
 		id, err := strconv.ParseInt(p, 10, 64)
 		if err != nil {
-			log.Printf("ALLOWED_TELEGRAM_IDS: yaroqsiz '%s'", p)
+			log.Printf("%s: yaroqsiz '%s'", label, p)
 			continue
 		}
 		out = append(out, id)

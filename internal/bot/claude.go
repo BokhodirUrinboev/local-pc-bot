@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,53 +17,10 @@ import (
 
 const (
 	claudeEditInterval = 1500 * time.Millisecond
-	claudeMaxWait      = 10 * time.Minute
+	claudeMaxWait      = 30 * time.Minute
 )
 
-// IsClaudeMode aktiv Claude rejimini tekshiradi.
-func (s *Session) IsClaudeMode() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.claudeMode
-}
-
-// EnterClaudeMode Claude rejimini yoqadi (binar yo'lini probe qilib).
-func (s *Session) EnterClaudeMode() {
-	s.mu.Lock()
-	if s.claudeMode {
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Unlock()
-
-	binPath, err := lookupClaudeBinary()
-	if err != nil {
-		text := "⚠️ Claude rejimini yoqib bo'lmadi: <code>claude</code> CLI PATH'da topilmadi.\n\n" +
-			"Bu kompyuterga Claude Code o'rnatilganmi? Tekshirish:\n" +
-			"<code>where.exe claude</code>"
-		msg := tgbotapi.NewMessage(s.ChatID, text)
-		msg.ParseMode = tgbotapi.ModeHTML
-		_, _ = s.bot.Send(msg)
-		return
-	}
-
-	s.mu.Lock()
-	s.claudeMode = true
-	s.claudeBinary = binPath
-	s.mu.Unlock()
-
-	text := "🤖 <b>Claude rejimi yoqildi</b>\n\n" +
-		"Yozgan har bir xabaringiz <code>claude -p</code> orqali yuboriladi. " +
-		"Javob real vaqtda strim qilib bitta xabarda yangilanadi.\n\n" +
-		"<code>" + htmlEscape(binPath) + "</code>\n\n" +
-		"/stop — aktiv promptni uzish\n" +
-		"/endclaude — rejimdan chiqish"
-	msg := tgbotapi.NewMessage(s.ChatID, text)
-	msg.ParseMode = tgbotapi.ModeHTML
-	_, _ = s.bot.Send(msg)
-}
-
-// lookupClaudeBinary Windows uchun bir nechta variantlarni sinab ko'radi (claude, claude.cmd, claude.exe).
+// lookupClaudeBinary Windows'da bir nechta variantni sinab ko'radi.
 func lookupClaudeBinary() (string, error) {
 	for _, name := range []string{"claude", "claude.cmd", "claude.exe", "claude.bat"} {
 		if p, err := exec.LookPath(name); err == nil {
@@ -72,48 +30,52 @@ func lookupClaudeBinary() (string, error) {
 	return "", fmt.Errorf("claude not found in PATH")
 }
 
-// ExitClaudeMode rejimdan chiqadi va sessiya kontekstini tozalaydi.
-func (s *Session) ExitClaudeMode() {
+// ensureClaudeBinary lazy probe qiladi.
+func (s *Session) ensureClaudeBinary() (string, error) {
 	s.mu.Lock()
-	was := s.claudeMode
-	s.claudeMode = false
-	s.claudeSessionID = ""
-	s.claudeBinary = ""
-	cancel := s.claudeCancel
-	s.claudeCancel = nil
+	bin := s.claudeBinary
 	s.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
+	if bin != "" {
+		return bin, nil
 	}
-	if was {
-		_, _ = s.bot.Send(tgbotapi.NewMessage(s.ChatID, "🤖 Claude rejimi o'chirildi."))
+	bin, err := lookupClaudeBinary()
+	if err != nil {
+		return "", err
 	}
+	s.mu.Lock()
+	s.claudeBinary = bin
+	s.mu.Unlock()
+	return bin, nil
 }
 
-// RunClaude bitta promptni claude -p orqali strim qilib ishlatadi.
-// stream-json chiqishini chiziq-chiziq parslab Telegram xabarini throttle bilan tahrirlaydi.
+// RunClaude Claude agentni stream-json rejimida ishga tushiradi.
+// `--dangerously-skip-permissions` orqali to'liq tool/MCP access beriladi —
+// workspace'dagi `.mcp.json` va `.claude/settings.json` avto-pickup qilinadi.
 func (s *Session) RunClaude(prompt string) {
 	s.cmdMu.Lock()
 	defer s.cmdMu.Unlock()
 
-	s.mu.Lock()
-	binary := s.claudeBinary
-	sessionID := s.claudeSessionID
-	cwd := s.cwd
-	s.mu.Unlock()
-
-	if binary == "" {
-		// Holat: kimdir EnterClaudeMode'siz to'g'ridan to'g'ri RunClaude chaqirgan
-		s.replyError("Claude binari probe qilinmagan. Avval /claude komandasini yuboring.")
+	binary, err := s.ensureClaudeBinary()
+	if err != nil {
+		text := "⚠️ <code>claude</code> CLI PATH'da topilmadi. " +
+			"Bu kompyuterga Claude Code o'rnatilganmi?\n<code>where.exe claude</code>"
+		msg := tgbotapi.NewMessage(s.ChatID, text)
+		msg.ParseMode = tgbotapi.ModeHTML
+		_, _ = s.bot.Send(msg)
 		return
 	}
+
+	s.mu.Lock()
+	sessionID := s.claudeSessionID
+	workdir := s.workdir
+	systemPrompt := s.systemPrompt
+	s.mu.Unlock()
 
 	placeholder := tgbotapi.NewMessage(s.ChatID, "🤖 <i>Claude o'ylayapti…</i>")
 	placeholder.ParseMode = tgbotapi.ModeHTML
 	sent, err := s.bot.Send(placeholder)
 	if err != nil {
-		log.Printf("claude placeholder (tg=%d): %v", s.TelegramID, err)
+		log.Printf("claude placeholder (chat=%d): %v", s.ChatID, err)
 		return
 	}
 
@@ -136,14 +98,21 @@ func (s *Session) RunClaude(prompt string) {
 		"--output-format", "stream-json",
 		"--include-partial-messages",
 		"--verbose",
+		"--dangerously-skip-permissions",
+	}
+	if systemPrompt != "" {
+		claudeArgs = append(claudeArgs, "--append-system-prompt", systemPrompt)
+	}
+	// Agar workdir ichida .mcp.json bo'lsa, aniq pass qilamiz.
+	if mcpPath := filepath.Join(workdir, ".mcp.json"); fileExists(mcpPath) {
+		claudeArgs = append(claudeArgs, "--mcp-config", mcpPath)
 	}
 	if sessionID != "" {
 		claudeArgs = append(claudeArgs, "--resume", sessionID)
 	}
 
 	// Claude'ni PowerShell orqali wrap qilamiz — Windows'da Go'ning to'g'ridan-to'g'ri
-	// exec.Command bilan claude.exe'ga OAuth/keychain handle to'liq pass bo'lmas ekan.
-	// PowerShell normal shell sifatida session/token/console attach qiladi.
+	// exec'i bilan claude.exe'ga OAuth/keychain handle to'liq pass bo'lmas ekan.
 	parts := make([]string, 0, len(claudeArgs)+2)
 	parts = append(parts, "&", psQuote(binary))
 	for _, a := range claudeArgs {
@@ -153,14 +122,13 @@ func (s *Session) RunClaude(prompt string) {
 
 	cmd := exec.CommandContext(ctx, "powershell.exe",
 		"-NoProfile", "-NoLogo", "-NonInteractive", "-Command", psCmd)
-	cmd.Dir = cwd
+	cmd.Dir = workdir
 
 	stdoutR, err := cmd.StdoutPipe()
 	if err != nil {
 		s.editClaudeText(sent.MessageID, "⚠️ Pipe xato: "+err.Error(), true)
 		return
 	}
-	// stderr'ni jim yutib yuboramiz
 	cmd.Stderr = io.Discard
 
 	if err := cmd.Start(); err != nil {
@@ -216,7 +184,7 @@ func (s *Session) RunClaude(prompt string) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		log.Printf("claude scanner (tg=%d): %v", s.TelegramID, err)
+		log.Printf("claude scanner (chat=%d): %v", s.ChatID, err)
 	}
 
 	waitErr := cmd.Wait()
@@ -331,6 +299,7 @@ func skipLeadingSpace(b []byte) []byte {
 
 // editClaudeText placeholder xabarni Claude javobi bilan yangilaydi.
 func (s *Session) editClaudeText(msgID int, body string, final bool) {
+	body = stripANSI(body)
 	body = strings.TrimRight(body, "\n")
 	if len(body) > maxMsgChars {
 		body = "…\n" + body[len(body)-maxMsgChars:]
@@ -345,7 +314,12 @@ func (s *Session) editClaudeText(msgID int, body string, final bool) {
 	edit.ParseMode = tgbotapi.ModeHTML
 	if _, err := s.bot.Send(edit); err != nil {
 		if !strings.Contains(err.Error(), "not modified") {
-			log.Printf("claude edit (tg=%d): %v", s.TelegramID, err)
+			log.Printf("claude edit (chat=%d): %v", s.ChatID, err)
 		}
 	}
+}
+
+// psQuote PowerShell single-quote escape ('  → ”).
+func psQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }

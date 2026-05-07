@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(rtk ls *)"
+      "Bash(rtk ls *)",
+      "Bash(rtk go *)"
     ]
   }
 }
