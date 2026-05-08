@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -51,7 +52,8 @@ func (s *Session) ensureClaudeBinary() (string, error) {
 // RunClaude Claude agentni stream-json rejimida ishga tushiradi.
 // `--dangerously-skip-permissions` orqali to'liq tool/MCP access beriladi —
 // workspace'dagi `.mcp.json` va `.claude/settings.json` avto-pickup qilinadi.
-func (s *Session) RunClaude(prompt string) {
+// threadID — forum topic ID (0 bo'lsa General/oddiy chat).
+func (s *Session) RunClaude(prompt string, threadID int) {
 	s.cmdMu.Lock()
 	defer s.cmdMu.Unlock()
 
@@ -59,9 +61,7 @@ func (s *Session) RunClaude(prompt string) {
 	if err != nil {
 		text := "⚠️ <code>claude</code> CLI PATH'da topilmadi. " +
 			"Bu kompyuterga Claude Code o'rnatilganmi?\n<code>where.exe claude</code>"
-		msg := tgbotapi.NewMessage(s.ChatID, text)
-		msg.ParseMode = tgbotapi.ModeHTML
-		_, _ = s.bot.Send(msg)
+		_, _ = SendInThread(s.bot, s.ChatID, threadID, text, tgbotapi.ModeHTML, nil)
 		return
 	}
 
@@ -69,13 +69,23 @@ func (s *Session) RunClaude(prompt string) {
 	sessionID := s.claudeSessionID
 	workdir := s.workdir
 	systemPrompt := s.systemPrompt
+	logsDir := s.logsDir
 	s.mu.Unlock()
 
-	placeholder := tgbotapi.NewMessage(s.ChatID, "🤖 <i>Claude o'ylayapti…</i>")
-	placeholder.ParseMode = tgbotapi.ModeHTML
-	sent, err := s.bot.Send(placeholder)
+	// System promptga `antiterror-logs` joylashuvini qo'shamiz — Claude shu
+	// papkadagi avvalgi `.log` fayllarni o'zi o'qib kontekst olishi uchun.
+	if logsDir != "" {
+		hint := "Logs path: " + logsDir
+		if systemPrompt != "" {
+			systemPrompt = systemPrompt + "\n\n" + hint
+		} else {
+			systemPrompt = hint
+		}
+	}
+
+	sent, err := SendInThread(s.bot, s.ChatID, threadID, "🤖 <i>Najim ishlayapti…</i>", tgbotapi.ModeHTML, nil)
 	if err != nil {
-		log.Printf("claude placeholder (chat=%d): %v", s.ChatID, err)
+		log.Printf("claude placeholder (chat=%d, thread=%d): %v", s.ChatID, threadID, err)
 		return
 	}
 
@@ -93,8 +103,29 @@ func (s *Session) RunClaude(prompt string) {
 		s.mu.Unlock()
 	}()
 
+	// Promptni temp UTF-8 faylga yozamiz: PowerShell -Command satrining
+	// Windows CreateProcess (~32K) cheklovidan oshib ketmasligi uchun. Aks holda
+	// uzun promptlarda "fork/exec ... powershell.exe: filename or extension is too long".
+	tmpFile, err := os.CreateTemp("", "remofy-prompt-*.txt")
+	if err != nil {
+		s.editClaudeText(sent.MessageID, "⚠️ Temp fayl xato: "+err.Error(), true)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmpFile.WriteString(prompt); err != nil {
+		tmpFile.Close()
+		s.editClaudeText(sent.MessageID, "⚠️ Temp fayl yozish xato: "+err.Error(), true)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		s.editClaudeText(sent.MessageID, "⚠️ Temp fayl yopish xato: "+err.Error(), true)
+		return
+	}
+
+	// `-p` argumentsiz — claude promptni stdin'dan oladi (pipe orqali yuboramiz).
 	claudeArgs := []string{
-		"-p", prompt,
+		"-p",
 		"--output-format", "stream-json",
 		"--include-partial-messages",
 		"--verbose",
@@ -113,8 +144,14 @@ func (s *Session) RunClaude(prompt string) {
 
 	// Claude'ni PowerShell orqali wrap qilamiz — Windows'da Go'ning to'g'ridan-to'g'ri
 	// exec'i bilan claude.exe'ga OAuth/keychain handle to'liq pass bo'lmas ekan.
-	parts := make([]string, 0, len(claudeArgs)+2)
-	parts = append(parts, "&", psQuote(binary))
+	// Temp faylni UTF-8 sifatida o'qib, claude.exe stdin'iga pipe qilamiz.
+	// $OutputEncoding/[Console]::*Encoding'ni UTF-8'ga majburlaymiz — aks holda
+	// Win-PS 5.1 default ASCII'da pipe qilib, Cyrillic/emoji '?'ga aylanadi.
+	parts := make([]string, 0, len(claudeArgs)+5)
+	parts = append(parts,
+		"$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();",
+		"[System.IO.File]::ReadAllText("+psQuote(tmpPath)+",[System.Text.Encoding]::UTF8)",
+		"|", "&", psQuote(binary))
 	for _, a := range claudeArgs {
 		parts = append(parts, psQuote(a))
 	}
@@ -301,8 +338,8 @@ func skipLeadingSpace(b []byte) []byte {
 func (s *Session) editClaudeText(msgID int, body string, final bool) {
 	body = stripANSI(body)
 	body = strings.TrimRight(body, "\n")
-	if len(body) > maxMsgChars {
-		body = "…\n" + body[len(body)-maxMsgChars:]
+	if r := []rune(body); len(r) > maxMsgChars {
+		body = "…\n" + string(r[len(r)-maxMsgChars:])
 	}
 	icon := "🤖 ✍️"
 	if final {

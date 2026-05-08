@@ -2,7 +2,9 @@ package bot
 
 import (
 	"context"
+	"log"
 	"os"
+	"path/filepath"
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -17,6 +19,7 @@ type Session struct {
 	bot          *tgbotapi.BotAPI
 	workdir      string
 	systemPrompt string // --append-system-prompt uchun (persona)
+	logsDir      string // har bir prompt+javobning .log fayli bu yerga yoziladi
 
 	mu              sync.Mutex
 	claudeSessionID string             // claude --resume uchun
@@ -33,6 +36,7 @@ type Manager struct {
 	bot          *tgbotapi.BotAPI
 	workdir      string
 	systemPrompt string
+	logsDir      string // <workdir>/antiterror-logs
 }
 
 func NewManager(bot *tgbotapi.BotAPI, workdir, systemPrompt string) *Manager {
@@ -43,15 +47,21 @@ func NewManager(bot *tgbotapi.BotAPI, workdir, systemPrompt string) *Manager {
 			workdir = "."
 		}
 	}
+	logsDir := filepath.Join(workdir, "antiterror-logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		log.Printf("logs dir create (%s): %v", logsDir, err)
+	}
 	return &Manager{
 		sessions:     map[int64]*Session{},
 		bot:          bot,
 		workdir:      workdir,
 		systemPrompt: systemPrompt,
+		logsDir:      logsDir,
 	}
 }
 
 func (m *Manager) Workdir() string { return m.workdir }
+func (m *Manager) LogsDir() string { return m.logsDir }
 
 // Get chat bo'yicha sessiyani qaytaradi yoki yangi yaratadi.
 func (m *Manager) Get(chatID int64) *Session {
@@ -65,6 +75,7 @@ func (m *Manager) Get(chatID int64) *Session {
 		bot:          m.bot,
 		workdir:      m.workdir,
 		systemPrompt: m.systemPrompt,
+		logsDir:      m.logsDir,
 	}
 	m.sessions[chatID] = s
 	return s

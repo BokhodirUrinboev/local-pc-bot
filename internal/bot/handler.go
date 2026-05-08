@@ -3,11 +3,17 @@ package bot
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+// Reply qilingan xabardagi fayl mazmunini cheklaymiz — Telegram messageda 4096 cap,
+// lekin Claude promptiga ko'proq sig'adi. Mantiqiy chegara — 256KB.
+const maxReplyDocBytes = 256 * 1024
 
 type Bot struct {
 	API     *tgbotapi.BotAPI
@@ -65,7 +71,10 @@ func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
 }
 
 // HandleUpdate har bir Telegram yangilanishini qabul qiladi.
-func (b *Bot) HandleUpdate(u tgbotapi.Update) {
+// threadID — agar xabar forum (topic) ichida bo'lsa, message_thread_id; aks holda 0.
+func (b *Bot) HandleUpdate(p Polled) {
+	u := p.Update
+	threadID := p.MessageThreadID
 	if u.Message == nil || u.Message.From == nil {
 		return
 	}
@@ -86,9 +95,7 @@ func (b *Bot) HandleUpdate(u tgbotapi.Update) {
 		// Private chatda ogohlantiramiz; gruppada esa jim turamiz (begona shovqin yo'q).
 		if !isGroup {
 			text := fmt.Sprintf("⛔ Sizga ushbu botdan foydalanishga ruxsat berilmagan.\n\nTelegram ID: <code>%d</code>", fromID)
-			msg := tgbotapi.NewMessage(chatID, text)
-			msg.ParseMode = tgbotapi.ModeHTML
-			_, _ = b.API.Send(msg)
+			_, _ = SendInThread(b.API, chatID, threadID, text, tgbotapi.ModeHTML, nil)
 		}
 		return
 	}
@@ -97,7 +104,7 @@ func (b *Bot) HandleUpdate(u tgbotapi.Update) {
 
 	// Slash komandalar har doim ishlaydi (gruppada ham)
 	if m.IsCommand() {
-		b.handleCommand(sess, m)
+		b.handleCommand(sess, m, threadID)
 		return
 	}
 
@@ -130,25 +137,94 @@ func (b *Bot) HandleUpdate(u tgbotapi.Update) {
 		}
 	}
 
-	go sess.RunClaude(text)
+	// Reply qilingan xabar bo'lsa — uning matni/captioni va biriktirilgan
+	// fayli (masalan .log) Claude promptiga kontekst sifatida qo'shiladi.
+	if rc := b.buildReplyContext(m.ReplyToMessage); rc != "" {
+		text = rc + "\n\n" + text
+	}
+
+	go sess.RunClaude(text, threadID)
 }
 
-func (b *Bot) handleCommand(sess *Session, m *tgbotapi.Message) {
+// buildReplyContext reply qilingan xabardan kontekst yig'adi:
+// matn/caption + agar Document biriktirilgan bo'lsa — uning mazmuni.
+// Hech narsa bo'lmasa "" qaytaradi.
+func (b *Bot) buildReplyContext(r *tgbotapi.Message) string {
+	if r == nil {
+		return ""
+	}
+	body := r.Text
+	if body == "" {
+		body = r.Caption
+	}
+
+	var doc string
+	if r.Document != nil {
+		content, err := b.downloadFile(r.Document.FileID, maxReplyDocBytes)
+		if err != nil {
+			log.Printf("reply doc download (file=%s): %v", r.Document.FileName, err)
+		} else if content != "" {
+			doc = fmt.Sprintf("<reply_fayl nomi=%q>\n%s\n</reply_fayl>", r.Document.FileName, content)
+		}
+	}
+
+	if body == "" && doc == "" {
+		return ""
+	}
+
+	var parts []string
+	parts = append(parts, "<reply_xabar>")
+	if body != "" {
+		parts = append(parts, body)
+	}
+	if doc != "" {
+		parts = append(parts, doc)
+	}
+	parts = append(parts, "</reply_xabar>")
+	return strings.Join(parts, "\n")
+}
+
+// downloadFile Telegram file_id orqali faylni yuklab oladi (maxBytes bilan cheklangan).
+func (b *Bot) downloadFile(fileID string, maxBytes int) (string, error) {
+	f, err := b.API.GetFile(tgbotapi.FileConfig{FileID: fileID})
+	if err != nil {
+		return "", err
+	}
+	url := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", b.API.Token, f.FilePath)
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxBytes {
+		return string(data[:maxBytes]) + "\n…(qisqartirildi)", nil
+	}
+	return string(data), nil
+}
+
+func (b *Bot) handleCommand(sess *Session, m *tgbotapi.Message, threadID int) {
 	switch m.Command() {
 	case "start", "help":
-		b.cmdHelp(sess)
+		b.cmdHelp(sess, threadID)
 	case "stop":
 		sess.SendInterrupt()
-		b.reply(sess, "⏹ Stop signal yuborildi.")
+		b.reply(sess, threadID, "⏹ Stop signal yuborildi.")
 	case "reset":
 		sess.Reset()
-		b.reply(sess, "🧹 Suhbat tarixi tozalandi. Yangi sessiya boshlanadi.")
+		b.reply(sess, threadID, "🧹 Suhbat tarixi tozalandi. Yangi sessiya boshlanadi.")
 	case "workdir":
-		b.reply(sess, "📂 <code>"+htmlEscape(b.Mgr.Workdir())+"</code>")
+		b.reply(sess, threadID, "📂 <code>"+htmlEscape(b.Mgr.Workdir())+"</code>")
 	default:
 		// Gruppada noma'lum komandaga javob bermaymiz (boshqa botniki bo'lishi mumkin).
 		if !(m.Chat.IsGroup() || m.Chat.IsSuperGroup()) {
-			b.reply(sess, "Noma'lum komanda. /help")
+			b.reply(sess, threadID, "Noma'lum komanda. /help")
 		}
 	}
 }
@@ -207,7 +283,7 @@ func stripBotMention(text, username string) string {
 	return text
 }
 
-func (b *Bot) cmdHelp(s *Session) {
+func (b *Bot) cmdHelp(s *Session, threadID int) {
 	text := `<b>Remofy bot</b> — Claude AI agent shu kompyuterda.
 
 Yozgan har qanday matn Claude'ga prompt sifatida yuboriladi va agent kerakli toollar (Read, Edit, Write, Bash, GitHub MCP) bilan ishlaydi.
@@ -225,19 +301,18 @@ Yozgan har qanday matn Claude'ga prompt sifatida yuboriladi va agent kerakli too
 
 <b>Workspace:</b> <code>` + htmlEscape(b.Mgr.Workdir()) + `</code>`
 
-	msg := tgbotapi.NewMessage(s.ChatID, text)
-	msg.ParseMode = tgbotapi.ModeHTML
 	// Reply keyboard faqat private chatda ko'rsatamiz — gruppada hammaga tushib ketmasin.
+	var rm interface{}
 	if s.ChatID > 0 {
-		msg.ReplyMarkup = mainKeyboard()
+		rm = mainKeyboard()
 	}
-	_, _ = b.API.Send(msg)
+	if _, err := SendInThread(b.API, s.ChatID, threadID, text, tgbotapi.ModeHTML, rm); err != nil {
+		log.Printf("cmdHelp (chat=%d): %v", s.ChatID, err)
+	}
 }
 
-func (b *Bot) reply(s *Session, text string) {
-	msg := tgbotapi.NewMessage(s.ChatID, text)
-	msg.ParseMode = tgbotapi.ModeHTML
-	if _, err := b.API.Send(msg); err != nil {
+func (b *Bot) reply(s *Session, threadID int, text string) {
+	if _, err := SendInThread(b.API, s.ChatID, threadID, text, tgbotapi.ModeHTML, nil); err != nil {
 		log.Printf("reply (chat=%d): %v", s.ChatID, err)
 	}
 }

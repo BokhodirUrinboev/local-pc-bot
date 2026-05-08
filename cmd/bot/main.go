@@ -71,9 +71,7 @@ func main() {
 		log.Printf("setChatMenuButton: %v", err)
 	}
 
-	uCfg := tgbotapi.NewUpdate(0)
-	uCfg.Timeout = 30
-	updates := api.GetUpdatesChan(uCfg)
+	updates := bot.PollUpdates(rootCtx, api, 30)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -81,11 +79,13 @@ func main() {
 	log.Println("Bot ishga tushdi. Ctrl+C — to'xtatish.")
 	for {
 		select {
-		case u := <-updates:
-			go b.HandleUpdate(u)
+		case p, ok := <-updates:
+			if !ok {
+				return
+			}
+			go b.HandleUpdate(p)
 		case <-stop:
 			log.Println("Shutdown signal — to'xtatilmoqda...")
-			api.StopReceivingUpdates()
 			cancel()
 			return
 		}
