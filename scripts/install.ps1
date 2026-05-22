@@ -155,9 +155,13 @@ $wSettings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 1) `
     -MultipleInstances IgnoreNew
 
+# Watchdog SYSTEM nomidan ishlaydi — bu shart edi, aks holda
+# har daqiqada Interactive user'ning desktop'ida PS oynasi miltillaydi.
+# Watchdog Claude OAuth'iga muhtoj emas, faqat Start-ScheduledTask qiladi
+# (SYSTEM hamma task'ni boshqara oladi).
 $wPrincipal = New-ScheduledTaskPrincipal `
-    -UserId $RunUser `
-    -LogonType Interactive `
+    -UserId "SYSTEM" `
+    -LogonType ServiceAccount `
     -RunLevel Highest
 
 Register-ScheduledTask `

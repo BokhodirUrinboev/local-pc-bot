@@ -58,6 +58,11 @@ func (s *Session) ensureClaudeBinary() (string, error) {
 // workspace'dagi `.mcp.json` va `.claude/settings.json` avto-pickup qilinadi.
 // threadID — forum topic ID (0 bo'lsa General/oddiy chat).
 func (s *Session) RunClaude(prompt string, threadID int) {
+	// Bu prompt qaysi "navbat avlodi"ga tegishli ekanini eslab qolamiz.
+	// /stop bosilsa, shu avlod cancel qilinadi va biz darrov bail qilamiz —
+	// foydalanuvchining hayoliga zid ravishda avtomatik ishga tushib ketmaymiz.
+	gen := s.CurrentQueueGen()
+
 	// Slot acquire: avvaliga darrov urinamiz. Band bo'lsa — foydalanuvchiga
 	// "navbatdaman" deb status yuboramiz va kutamiz. Cap claudeQueueWait —
 	// shunda hech qachon abadiy ilinmaymiz, lekin uzoq legit ishlarga joy bor.
@@ -65,6 +70,9 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 	select {
 	case s.cmdSlot <- struct{}{}:
 		// darrov olindi
+	case <-gen.ctx.Done():
+		// /stop biz harakat qilmasdan oldin tushdi (juda kam ehtimol) — jim bail.
+		return
 	default:
 		sent, err := SendInThread(s.bot, s.ChatID, threadID,
 			"📥 <i>Avvalgi promtim hali ishlayapti — navbatda turibman.</i>\n<i>Tezroq kerak bo'lsa: <code>/stop</code></i>",
@@ -75,6 +83,12 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		select {
 		case s.cmdSlot <- struct{}{}:
 			// kutib oldik
+		case <-gen.ctx.Done():
+			// /stop navbat'ni bekor qildi — bizning prompt'ga ham endi keraksiz.
+			if queueMsgID != 0 {
+				_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(s.ChatID, queueMsgID))
+			}
+			return
 		case <-time.After(claudeQueueWait):
 			if queueMsgID != 0 {
 				edit := tgbotapi.NewEditMessageText(s.ChatID, queueMsgID,
@@ -86,6 +100,15 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		}
 	}
 	defer func() { <-s.cmdSlot }()
+
+	// Slot'ni olib bo'lganimizdan keyin ham tekshiramiz: navbatda kutayotganda
+	// /stop bo'lib o'tgan bo'lishi mumkin (oraliq race).
+	if gen.ctx.Err() != nil {
+		if queueMsgID != 0 {
+			_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(s.ChatID, queueMsgID))
+		}
+		return
+	}
 
 	// "Navbatdaman" status xabarini olib tashlaymiz — endi haqiqiy ish boshlanyapti.
 	if queueMsgID != 0 {

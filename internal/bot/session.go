@@ -31,6 +31,18 @@ type Session struct {
 	// timeout qabul qilmaydi). Yangi promtlar kutib turishi mumkin (long-running
 	// 10-15 daqiqalik ishlar uchun navbat kerak), lekin cap claudeQueueWait bilan.
 	cmdSlot chan struct{}
+
+	// queueGen — joriy "navbat avlodi". /stop bosilganda butun avlod cancel
+	// qilinadi (navbatdagi barcha promtlar bail qiladi), keyin yangi avlod
+	// boshlanadi. Aks holda /stop faqat hozirgi promtni o'ldirardi va
+	// navbatdagisi avtomatik ishga tushib ketardi.
+	queueGen *queueGen
+}
+
+// queueGen — bitta navbat avlodi: kontekst va uni cancel qiluvchi func.
+type queueGen struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // Manager — barcha chat sessiyalari ro'yxati. Lazy yaratiladi.
@@ -85,24 +97,49 @@ func (s *Session) Reset() {
 	s.mu.Unlock()
 }
 
-// SendInterrupt aktiv Claude exec'ni uzadi (Ctrl+C analog).
-// cmdMu'ni KUTMAYDI — turg'un promptni uzish kerak.
-// Ikki yo'l bilan urinadi: (1) context cancel — Go runtime cmd.Cancel'ni chaqiradi,
-// (2) bevosita `taskkill /F /T /PID <ps_pid>` — agar (1) Go internal'ida ilinib qolsa
-// ham, daraxt aniq o'ladi. Bularning ikkalasi cmdMu'ni ushlamasdan ishlaydi.
+// CurrentQueueGen joriy navbat avlodini qaytaradi (yangi prompt qaysi
+// generation'ga tegishli ekanini bilishi uchun). Hech qachon nil emas —
+// agar bo'sh bo'lsa, yangi yaratiladi.
+func (s *Session) CurrentQueueGen() *queueGen {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.queueGen == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.queueGen = &queueGen{ctx: ctx, cancel: cancel}
+	}
+	return s.queueGen
+}
+
+// SendInterrupt aktiv Claude exec'ni uzadi (Ctrl+C analog) VA navbatdagi
+// barcha promtlarni ham bekor qiladi. cmd slot'ni KUTMAYDI.
+// Uch yo'l bilan urinadi:
+//
+//	(1) context cancel — Go runtime cmd.Cancel'ni chaqiradi
+//	(2) bevosita `taskkill /F /T /PID <ps_pid>` — Go internal'ida ilinib qolishlardan xalos
+//	(3) joriy navbat avlodini cancel qiladi — navbatdagilar avtomatik
+//	    ishga tushishini oldini oladi
 func (s *Session) SendInterrupt() {
 	s.mu.Lock()
 	cancel := s.claudeCancel
 	pid := s.claudePID
+	oldGen := s.queueGen
 	s.claudeCancel = nil
 	s.claudePID = 0
+	// Yangi avlod boshlaymiz — endi kelayotgan promtlar shu /stop'dan ta'sirlanmaydi.
+	newCtx, newCancel := context.WithCancel(context.Background())
+	s.queueGen = &queueGen{ctx: newCtx, cancel: newCancel}
 	s.mu.Unlock()
+
 	if cancel != nil {
 		cancel()
 	}
 	if pid > 0 {
 		// /T — butun daraxt (PowerShell + claude.exe + node MCP children).
 		_ = exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
+	}
+	if oldGen != nil {
+		// Navbatda kutayotgan barcha goroutine'lar shu ctx.Done()'ni ko'rib bail qiladi.
+		oldGen.cancel()
 	}
 }
 
