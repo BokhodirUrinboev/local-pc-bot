@@ -13,7 +13,7 @@ ishga tushirishga ruxsat beradi.
 - **Whitelist:** faqat ruxsat etilgan Telegram ID'lar foydalana oladi (`ALLOWED_TELEGRAM_IDS`), gruppalar uchun alohida (`ALLOWED_CHAT_IDS`)
 - **Navbat:** har bir chatda bir vaqtda faqat bitta komanda ishlaydi, qolganlari kutadi
 - **Stop tugmasi:** aktiv komandani Telegramdan to'xtatish (`taskkill /F /T` butun process daraxti)
-- **Server sifatida:** Task Scheduler orqali boot'da avtomatik ishga tushadi, crash bo'lsa qayta ishga tushadi
+- **Server sifatida:** login'da avtomatik ishga tushadi (Task Scheduler, joriy foydalanuvchi ostida — Claude OAuth tokeni uchun); `RemofyBotWatchdog` har 1 daqiqada bot o'lik bo'lsa qayta ko'taradi
 
 ## Sozlash (lokal)
 
@@ -43,7 +43,8 @@ go build -ldflags='-s -w' -o '.dist\remofy-bot.exe' .\cmd\bot
 Bu quyidagilarni qiladi:
 - `C:\ProgramData\remofy-bot\` ga fayllarni o'rnatadi
 - AC quvvatda hech qachon uxlamasin deb power planni o'zgartiradi
-- LocalSystem ostida `RemofyBot` Task Scheduler taskini yaratadi (boot'da auto-start, crash → restart)
+- Joriy foydalanuvchi (Interactive) ostida `RemofyBot` taskini yaratadi (login'da +30s auto-start). SYSTEM emas, chunki Claude OAuth tokeni shu profil ichida (`%USERPROFILE%\.claude\`)
+- `RemofyBotWatchdog` taskini yaratadi (SYSTEM, har 1 daqiqada: `RemofyBot` Running bo'lmasa qayta ishga tushiradi)
 - Botni darhol ishga tushiradi
 
 ## Komandalar
