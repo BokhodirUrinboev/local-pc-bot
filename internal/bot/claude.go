@@ -224,11 +224,14 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 	// ko'ra ishlamasa, 5 sek dan keyin Go o'zi forceful kill qiladi.
 	cmd.WaitDelay = 5 * time.Second
 
-	stdoutR, err := cmd.StdoutPipe()
-	if err != nil {
-		s.editClaudeText(sent.MessageID, "⚠️ Pipe xato: "+err.Error(), true)
-		return
-	}
+	// stdout'ni io.Pipe orqali olamiz (cmd.StdoutPipe() EMAS): cmd.Wait()'ni
+	// alohida goroutine'da chaqirib, process o'lgach pw'ni yopamiz. Shunda quyidagi
+	// scanner EOF oladi — hatto claude.exe nevaralari (MCP npx/node) stdout handle'ni
+	// ushlab tursa ham. StdoutPipe'ni main goroutine'da to'g'ridan-to'g'ri o'qish
+	// /stop'da DEADLOCK berardi: nevara handle'ni ushlasa scanner bloklanardi,
+	// cmd.Wait() (va uning WaitDelay kafolati) esa hech qachon ishga tushmasdi.
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
 	cmd.Stderr = io.Discard
 
 	if err := cmd.Start(); err != nil {
@@ -247,6 +250,14 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		s.mu.Unlock()
 	}()
 
+	// cmd.Wait()'ni alohida goroutine'da: process o'lgach (WaitDelay bilan 5s kafolat)
+	// pw yopiladi → pastdagi scanner EOF oladi va slot bo'shaydi.
+	waitErrCh := make(chan error, 1)
+	go func() {
+		waitErrCh <- cmd.Wait()
+		_ = pw.Close()
+	}()
+
 	var (
 		text       strings.Builder
 		lastEdit   time.Time
@@ -255,7 +266,7 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		gotErr     string
 	)
 
-	scanner := bufio.NewScanner(stdoutR)
+	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -298,7 +309,7 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		log.Printf("claude scanner (chat=%d): %v", s.ChatID, err)
 	}
 
-	waitErr := cmd.Wait()
+	waitErr := <-waitErrCh
 
 	if capturedID != "" {
 		s.mu.Lock()
