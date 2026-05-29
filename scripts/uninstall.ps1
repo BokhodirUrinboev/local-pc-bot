@@ -4,19 +4,22 @@
 
 $ErrorActionPreference = "Continue"
 
-$InstallDir = "C:\ProgramData\remofy-bot"
-$TaskName   = "RemofyBot"
+$InstallDir   = "C:\ProgramData\remofy-bot"
+$TaskName     = "RemofyBot"
+$WatchdogTask = "RemofyBotWatchdog"
 
 Write-Host "==> Remofy Bot uninstall" -ForegroundColor Cyan
 
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing) {
-    Write-Host "==> Stopping task..."
-    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    Write-Host "    Task '$TaskName' removed" -ForegroundColor Green
-} else {
-    Write-Host "    Task not found (already removed)"
+foreach ($t in @($WatchdogTask, $TaskName)) {
+    $existing = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "==> Stopping task '$t'..."
+        try { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue } catch {}
+        Unregister-ScheduledTask -TaskName $t -Confirm:$false
+        Write-Host "    Task '$t' removed" -ForegroundColor Green
+    } else {
+        Write-Host "    Task '$t' not found (already removed)"
+    }
 }
 
 Get-Process -Name "remofy-bot" -ErrorAction SilentlyContinue | ForEach-Object {

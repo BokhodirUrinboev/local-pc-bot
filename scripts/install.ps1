@@ -14,10 +14,17 @@
 
 $ErrorActionPreference = "Stop"
 
-$RepoRoot   = Split-Path -Parent $PSScriptRoot
-$InstallDir = "C:\ProgramData\remofy-bot"
-$LogDir     = Join-Path $InstallDir "logs"
-$TaskName   = "RemofyBot"
+$RepoRoot     = Split-Path -Parent $PSScriptRoot
+$InstallDir   = "C:\ProgramData\remofy-bot"
+$LogDir       = Join-Path $InstallDir "logs"
+$TaskName     = "RemofyBot"
+$WatchdogTask = "RemofyBotWatchdog"
+
+# Bot CURRENT USER nomidan ishlashi shart — Claude CLI OAuth tokeni shu
+# foydalanuvchi profili ichida (`%USERPROFILE%\.claude\`). SYSTEM bo'lsa
+# "Not logged in" xatosi chiqadi. Interactive logon token kerak.
+$RunUser = "$env:USERDOMAIN\$env:USERNAME"
+Write-Host "    RunAs:      $RunUser"
 
 $ExeSrc     = Join-Path $RepoRoot ".dist\remofy-bot.exe"
 $WrapperSrc = Join-Path $PSScriptRoot "run-bot.ps1"
@@ -41,13 +48,15 @@ if (-not (Test-Path $WrapperSrc)) {
     exit 1
 }
 
-# --- Stop and remove existing task ---
-Write-Host "==> Checking existing task..."
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing) {
-    Write-Host "    Found old task -- stopping and removing..."
-    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+# --- Stop and remove existing tasks ---
+Write-Host "==> Checking existing tasks..."
+foreach ($t in @($TaskName, $WatchdogTask)) {
+    $existing = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "    Found old task '$t' -- stopping and removing..."
+        try { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue } catch {}
+        Unregister-ScheduledTask -TaskName $t -Confirm:$false
+    }
 }
 
 # Stop existing bot process (so we can replace the .exe)
@@ -98,7 +107,7 @@ $action = New-ScheduledTaskAction `
     -Argument $psArgs `
     -WorkingDirectory $InstallDir
 
-$trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $RunUser
 $trigger.Delay = "PT30S"
 
 $settings = New-ScheduledTaskSettingsSet `
@@ -111,8 +120,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew
 
 $principal = New-ScheduledTaskPrincipal `
-    -UserId "SYSTEM" `
-    -LogonType ServiceAccount `
+    -UserId $RunUser `
+    -LogonType Interactive `
     -RunLevel Highest
 
 Register-ScheduledTask `
@@ -125,13 +134,56 @@ Register-ScheduledTask `
 
 Write-Host "    Task '$TaskName' registered (LocalSystem)" -ForegroundColor Green
 
+# --- Watchdog task: every 1 minute, restart RemofyBot if not Running ---
+Write-Host "==> Creating watchdog task..."
+
+$watchdogCmd = "if ((Get-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue).State -ne 'Running') { Start-ScheduledTask -TaskName '$TaskName' }"
+$watchdogArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$watchdogCmd`""
+
+$wAction = New-ScheduledTaskAction `
+    -Execute "powershell.exe" `
+    -Argument $watchdogArgs
+
+$wTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1) `
+    -RepetitionDuration (New-TimeSpan -Days 9999)
+
+$wSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 1) `
+    -MultipleInstances IgnoreNew
+
+# Watchdog SYSTEM nomidan ishlaydi — bu shart edi, aks holda
+# har daqiqada Interactive user'ning desktop'ida PS oynasi miltillaydi.
+# Watchdog Claude OAuth'iga muhtoj emas, faqat Start-ScheduledTask qiladi
+# (SYSTEM hamma task'ni boshqara oladi).
+$wPrincipal = New-ScheduledTaskPrincipal `
+    -UserId "SYSTEM" `
+    -LogonType ServiceAccount `
+    -RunLevel Highest
+
+Register-ScheduledTask `
+    -TaskName    $WatchdogTask `
+    -Description "Restarts RemofyBot if it's not Running (every 1 min)" `
+    -Action      $wAction `
+    -Trigger     $wTrigger `
+    -Settings    $wSettings `
+    -Principal   $wPrincipal | Out-Null
+
+Write-Host "    Task '$WatchdogTask' registered (1-min watchdog)" -ForegroundColor Green
+
 # --- Start now ---
 Write-Host "==> Starting bot..."
 Start-ScheduledTask -TaskName $TaskName
+Start-ScheduledTask -TaskName $WatchdogTask
 Start-Sleep -Seconds 3
 
-$state = (Get-ScheduledTask -TaskName $TaskName).State
-Write-Host "    Status: $state"
+$state         = (Get-ScheduledTask -TaskName $TaskName).State
+$watchdogState = (Get-ScheduledTask -TaskName $WatchdogTask).State
+Write-Host "    ${TaskName}: $state"
+Write-Host "    ${WatchdogTask}: $watchdogState"
 
 Write-Host ""
 Write-Host "==> DONE!" -ForegroundColor Cyan

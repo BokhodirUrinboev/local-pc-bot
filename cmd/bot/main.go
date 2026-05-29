@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"remofy-bot/internal/bot"
 
@@ -30,6 +32,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Telegram init: %v", err)
 	}
+	// Default HTTP client'da timeout yo'q — agar Telegram javob bermay turib qolsa,
+	// edit/send chaqiruvi abadiy bloklanadi va RunClaude'ning cmdMu'sini band qiladi.
+	// 60s — long-polling timeout (30s) ustidan xavfsiz qopla.
+	api.Client = &http.Client{Timeout: 60 * time.Second}
 	log.Printf("Bot: @%s (id=%d)", api.Self.UserName, api.Self.ID)
 	log.Printf("Workdir: %s", workdir)
 

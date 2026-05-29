@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,9 @@ import (
 const (
 	claudeEditInterval = 1500 * time.Millisecond
 	claudeMaxWait      = 30 * time.Minute
+	// Yangi prompt avvalgisi tugashini shu vaqtgacha kutadi. Cap > claudeMaxWait —
+	// shunda timeout'ga uchragan avvalgi ish bekor bo'lgach, navbatdagisi ham yetadi.
+	claudeQueueWait = claudeMaxWait + time.Minute
 )
 
 // lookupClaudeBinary Windows'da bir nechta variantni sinab ko'radi.
@@ -54,8 +58,62 @@ func (s *Session) ensureClaudeBinary() (string, error) {
 // workspace'dagi `.mcp.json` va `.claude/settings.json` avto-pickup qilinadi.
 // threadID — forum topic ID (0 bo'lsa General/oddiy chat).
 func (s *Session) RunClaude(prompt string, threadID int) {
-	s.cmdMu.Lock()
-	defer s.cmdMu.Unlock()
+	// Bu prompt qaysi "navbat avlodi"ga tegishli ekanini eslab qolamiz.
+	// /stop bosilsa, shu avlod cancel qilinadi va biz darrov bail qilamiz —
+	// foydalanuvchining hayoliga zid ravishda avtomatik ishga tushib ketmaymiz.
+	gen := s.CurrentQueueGen()
+
+	// Slot acquire: avvaliga darrov urinamiz. Band bo'lsa — foydalanuvchiga
+	// "navbatdaman" deb status yuboramiz va kutamiz. Cap claudeQueueWait —
+	// shunda hech qachon abadiy ilinmaymiz, lekin uzoq legit ishlarga joy bor.
+	var queueMsgID int
+	select {
+	case s.cmdSlot <- struct{}{}:
+		// darrov olindi
+	case <-gen.ctx.Done():
+		// /stop biz harakat qilmasdan oldin tushdi (juda kam ehtimol) — jim bail.
+		return
+	default:
+		sent, err := SendInThread(s.bot, s.ChatID, threadID,
+			"📥 <i>Avvalgi promtim hali ishlayapti — navbatda turibman.</i>\n<i>Tezroq kerak bo'lsa: <code>/stop</code></i>",
+			tgbotapi.ModeHTML, nil)
+		if err == nil && sent.MessageID != 0 {
+			queueMsgID = sent.MessageID
+		}
+		select {
+		case s.cmdSlot <- struct{}{}:
+			// kutib oldik
+		case <-gen.ctx.Done():
+			// /stop navbat'ni bekor qildi — bizning prompt'ga ham endi keraksiz.
+			if queueMsgID != 0 {
+				_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(s.ChatID, queueMsgID))
+			}
+			return
+		case <-time.After(claudeQueueWait):
+			if queueMsgID != 0 {
+				edit := tgbotapi.NewEditMessageText(s.ChatID, queueMsgID,
+					"⌛ Navbat vaqti tugadi — avvalgi promtim hali tirik. <code>/stop</code> bilan to'xtatib qayta yuboring.")
+				edit.ParseMode = tgbotapi.ModeHTML
+				_, _ = s.bot.Send(edit)
+			}
+			return
+		}
+	}
+	defer func() { <-s.cmdSlot }()
+
+	// Slot'ni olib bo'lganimizdan keyin ham tekshiramiz: navbatda kutayotganda
+	// /stop bo'lib o'tgan bo'lishi mumkin (oraliq race).
+	if gen.ctx.Err() != nil {
+		if queueMsgID != 0 {
+			_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(s.ChatID, queueMsgID))
+		}
+		return
+	}
+
+	// "Navbatdaman" status xabarini olib tashlaymiz — endi haqiqiy ish boshlanyapti.
+	if queueMsgID != 0 {
+		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(s.ChatID, queueMsgID))
+	}
 
 	binary, err := s.ensureClaudeBinary()
 	if err != nil {
@@ -69,19 +127,7 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 	sessionID := s.claudeSessionID
 	workdir := s.workdir
 	systemPrompt := s.systemPrompt
-	logsDir := s.logsDir
 	s.mu.Unlock()
-
-	// System promptga `antiterror-logs` joylashuvini qo'shamiz — Claude shu
-	// papkadagi avvalgi `.log` fayllarni o'zi o'qib kontekst olishi uchun.
-	if logsDir != "" {
-		hint := "Logs path: " + logsDir
-		if systemPrompt != "" {
-			systemPrompt = systemPrompt + "\n\n" + hint
-		} else {
-			systemPrompt = hint
-		}
-	}
 
 	sent, err := SendInThread(s.bot, s.ChatID, threadID, "🤖 <i>Najim ishlayapti…</i>", tgbotapi.ModeHTML, nil)
 	if err != nil {
@@ -160,6 +206,19 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 	cmd := exec.CommandContext(ctx, "powershell.exe",
 		"-NoProfile", "-NoLogo", "-NonInteractive", "-Command", psCmd)
 	cmd.Dir = workdir
+	// Windows'da context cancel default holatda faqat PowerShell processni
+	// `TerminateProcess` qiladi, lekin uning farzand `claude.exe` ni qoldiradi —
+	// orphan bo'lib token sarflashda davom etadi. `taskkill /F /T` butun process
+	// daraxtini (PowerShell + claude.exe + uning child'lari) o'ldiradi.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		return exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+	}
+	// Cancel'dan keyin Wait'ni cheksiz kutmaymiz — agar taskkill biror sababga
+	// ko'ra ishlamasa, 5 sek dan keyin Go o'zi forceful kill qiladi.
+	cmd.WaitDelay = 5 * time.Second
 
 	stdoutR, err := cmd.StdoutPipe()
 	if err != nil {
@@ -172,6 +231,17 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		s.editClaudeText(sent.MessageID, "⚠️ Start xato: "+err.Error(), true)
 		return
 	}
+
+	// PID'ni SendInterrupt to'g'ridan-to'g'ri taskkill qilishi uchun saqlaymiz —
+	// context cancel path biror sababga ko'ra ilinsa ham, /stop kafolatlangan o'ldirish bo'ladi.
+	s.mu.Lock()
+	s.claudePID = cmd.Process.Pid
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.claudePID = 0
+		s.mu.Unlock()
+	}()
 
 	var (
 		text       strings.Builder

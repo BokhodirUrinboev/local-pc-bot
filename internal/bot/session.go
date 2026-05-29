@@ -2,9 +2,9 @@ package bot
 
 import (
 	"context"
-	"log"
 	"os"
-	"path/filepath"
+	"os/exec"
+	"strconv"
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -19,14 +19,30 @@ type Session struct {
 	bot          *tgbotapi.BotAPI
 	workdir      string
 	systemPrompt string // --append-system-prompt uchun (persona)
-	logsDir      string // har bir prompt+javobning .log fayli bu yerga yoziladi
 
 	mu              sync.Mutex
 	claudeSessionID string             // claude --resume uchun
 	claudeBinary    string             // probed yo'l (lazy)
 	claudeCancel    context.CancelFunc // aktiv claude exec'ni uzish
+	claudePID       int                // aktiv PowerShell wrapper PID (taskkill /T uchun)
 
-	cmdMu sync.Mutex // bir chat ichida bir vaqtda bitta Claude prompti
+	// cmdSlot — buferli kanal o'lchami 1: send-acquire/recv-release pattern bilan
+	// mutex vazifasini bajaradi, lekin timed-acquire imkonini beradi (Mutex.Lock
+	// timeout qabul qilmaydi). Yangi promtlar kutib turishi mumkin (long-running
+	// 10-15 daqiqalik ishlar uchun navbat kerak), lekin cap claudeQueueWait bilan.
+	cmdSlot chan struct{}
+
+	// queueGen — joriy "navbat avlodi". /stop bosilganda butun avlod cancel
+	// qilinadi (navbatdagi barcha promtlar bail qiladi), keyin yangi avlod
+	// boshlanadi. Aks holda /stop faqat hozirgi promtni o'ldirardi va
+	// navbatdagisi avtomatik ishga tushib ketardi.
+	queueGen *queueGen
+}
+
+// queueGen — bitta navbat avlodi: kontekst va uni cancel qiluvchi func.
+type queueGen struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // Manager — barcha chat sessiyalari ro'yxati. Lazy yaratiladi.
@@ -36,7 +52,6 @@ type Manager struct {
 	bot          *tgbotapi.BotAPI
 	workdir      string
 	systemPrompt string
-	logsDir      string // <workdir>/antiterror-logs
 }
 
 func NewManager(bot *tgbotapi.BotAPI, workdir, systemPrompt string) *Manager {
@@ -47,21 +62,15 @@ func NewManager(bot *tgbotapi.BotAPI, workdir, systemPrompt string) *Manager {
 			workdir = "."
 		}
 	}
-	logsDir := filepath.Join(workdir, "antiterror-logs")
-	if err := os.MkdirAll(logsDir, 0o755); err != nil {
-		log.Printf("logs dir create (%s): %v", logsDir, err)
-	}
 	return &Manager{
 		sessions:     map[int64]*Session{},
 		bot:          bot,
 		workdir:      workdir,
 		systemPrompt: systemPrompt,
-		logsDir:      logsDir,
 	}
 }
 
 func (m *Manager) Workdir() string { return m.workdir }
-func (m *Manager) LogsDir() string { return m.logsDir }
 
 // Get chat bo'yicha sessiyani qaytaradi yoki yangi yaratadi.
 func (m *Manager) Get(chatID int64) *Session {
@@ -75,7 +84,7 @@ func (m *Manager) Get(chatID int64) *Session {
 		bot:          m.bot,
 		workdir:      m.workdir,
 		systemPrompt: m.systemPrompt,
-		logsDir:      m.logsDir,
+		cmdSlot:      make(chan struct{}, 1),
 	}
 	m.sessions[chatID] = s
 	return s
@@ -88,15 +97,49 @@ func (s *Session) Reset() {
 	s.mu.Unlock()
 }
 
-// SendInterrupt aktiv Claude exec'ni uzadi (Ctrl+C analog).
-// cmdMu'ni KUTMAYDI — turg'un promptni uzish kerak.
+// CurrentQueueGen joriy navbat avlodini qaytaradi (yangi prompt qaysi
+// generation'ga tegishli ekanini bilishi uchun). Hech qachon nil emas —
+// agar bo'sh bo'lsa, yangi yaratiladi.
+func (s *Session) CurrentQueueGen() *queueGen {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.queueGen == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.queueGen = &queueGen{ctx: ctx, cancel: cancel}
+	}
+	return s.queueGen
+}
+
+// SendInterrupt aktiv Claude exec'ni uzadi (Ctrl+C analog) VA navbatdagi
+// barcha promtlarni ham bekor qiladi. cmd slot'ni KUTMAYDI.
+// Uch yo'l bilan urinadi:
+//
+//	(1) context cancel — Go runtime cmd.Cancel'ni chaqiradi
+//	(2) bevosita `taskkill /F /T /PID <ps_pid>` — Go internal'ida ilinib qolishlardan xalos
+//	(3) joriy navbat avlodini cancel qiladi — navbatdagilar avtomatik
+//	    ishga tushishini oldini oladi
 func (s *Session) SendInterrupt() {
 	s.mu.Lock()
 	cancel := s.claudeCancel
+	pid := s.claudePID
+	oldGen := s.queueGen
 	s.claudeCancel = nil
+	s.claudePID = 0
+	// Yangi avlod boshlaymiz — endi kelayotgan promtlar shu /stop'dan ta'sirlanmaydi.
+	newCtx, newCancel := context.WithCancel(context.Background())
+	s.queueGen = &queueGen{ctx: newCtx, cancel: newCancel}
 	s.mu.Unlock()
+
 	if cancel != nil {
 		cancel()
+	}
+	if pid > 0 {
+		// /T — butun daraxt (PowerShell + claude.exe + node MCP children).
+		_ = exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
+	}
+	if oldGen != nil {
+		// Navbatda kutayotgan barcha goroutine'lar shu ctx.Done()'ni ko'rib bail qiladi.
+		oldGen.cancel()
 	}
 }
 
