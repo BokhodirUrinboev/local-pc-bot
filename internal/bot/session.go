@@ -12,7 +12,15 @@ import (
 
 const maxMsgChars = 3800
 
-// Session — bitta Telegram chat (private yoki group) uchun Claude agent konteksti.
+// SessionMode — chat default rejimi: free-text qaysi handlerga ketadi.
+type SessionMode string
+
+const (
+	ModePowerShell SessionMode = "powershell" // default: free-text → PS
+	ModeClaude     SessionMode = "claude"     // free-text → Claude
+)
+
+// Session — bitta Telegram chat (private yoki group) uchun konteks.
 // Group chat'da hamma a'zo shu bitta sessiyani baham ko'radi (jamoa xotirasi).
 type Session struct {
 	ChatID       int64
@@ -21,9 +29,10 @@ type Session struct {
 	systemPrompt string // --append-system-prompt uchun (persona)
 
 	mu              sync.Mutex
+	mode            SessionMode        // free-text default rejimi
 	claudeSessionID string             // claude --resume uchun
 	claudeBinary    string             // probed yo'l (lazy)
-	claudeCancel    context.CancelFunc // aktiv claude exec'ni uzish
+	claudeCancel    context.CancelFunc // aktiv exec'ni uzish (Claude yoki PS)
 	claudePID       int                // aktiv PowerShell wrapper PID (taskkill /T uchun)
 
 	// cmdSlot — buferli kanal o'lchami 1: send-acquire/recv-release pattern bilan
@@ -84,13 +93,35 @@ func (m *Manager) Get(chatID int64) *Session {
 		bot:          m.bot,
 		workdir:      m.workdir,
 		systemPrompt: m.systemPrompt,
+		mode:         ModePowerShell,
 		cmdSlot:      make(chan struct{}, 1),
 	}
 	m.sessions[chatID] = s
 	return s
 }
 
-// Reset Claude sessiyasini tozalaydi (--resume bekor qilinadi).
+// Mode joriy free-text rejimi.
+func (s *Session) Mode() SessionMode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mode
+}
+
+// SetMode rejimni o'zgartiradi.
+func (s *Session) SetMode(m SessionMode) {
+	s.mu.Lock()
+	s.mode = m
+	s.mu.Unlock()
+}
+
+// Workdir sessiya ishlayotgan papkani qaytaradi.
+func (s *Session) Workdir() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.workdir
+}
+
+// Reset Claude sessiyasini tozalaydi (--resume bekor qilinadi). Mode o'zgarmaydi.
 func (s *Session) Reset() {
 	s.mu.Lock()
 	s.claudeSessionID = ""

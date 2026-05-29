@@ -135,7 +135,11 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), claudeMaxWait)
+	// Parent — gen.ctx: /stop navbat avlodini cancel qilganda bu exec ham
+	// avtomatik o'ladi (cmd.Cancel → taskkill), claudeCancel set bo'lishini
+	// kutmasdan. Aks holda slot-acquire bilan claudeCancel-set orasidagi
+	// oraliqda /stop bosilsa, jarayon orphan bo'lib ishlab ketardi.
+	ctx, cancel := context.WithTimeout(gen.ctx, claudeMaxWait)
 	defer cancel()
 
 	s.mu.Lock()

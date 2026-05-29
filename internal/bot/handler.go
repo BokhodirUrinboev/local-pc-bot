@@ -54,7 +54,9 @@ func BotCommands() []tgbotapi.BotCommand {
 	return []tgbotapi.BotCommand{
 		{Command: "start", Description: "Boshlash / yordam"},
 		{Command: "help", Description: "Yordam"},
-		{Command: "stop", Description: "Aktiv promptni to'xtatish"},
+		{Command: "powershell", Description: "PowerShell rejimi (default)"},
+		{Command: "claude", Description: "Claude AI rejimi"},
+		{Command: "stop", Description: "Aktiv komandani to'xtatish"},
 		{Command: "reset", Description: "Suhbat tarixini tozalash"},
 		{Command: "workdir", Description: "Joriy ish papkasi"},
 	}
@@ -138,12 +140,17 @@ func (b *Bot) HandleUpdate(p Polled) {
 	}
 
 	// Reply qilingan xabar bo'lsa — uning matni/captioni va biriktirilgan
-	// fayli (masalan .log) Claude promptiga kontekst sifatida qo'shiladi.
+	// fayli (masalan .log) prompt/komandaga kontekst sifatida qo'shiladi.
 	if rc := b.buildReplyContext(m.ReplyToMessage); rc != "" {
 		text = rc + "\n\n" + text
 	}
 
-	go sess.RunClaude(text, threadID)
+	switch sess.Mode() {
+	case ModeClaude:
+		go sess.RunClaude(text, threadID)
+	default:
+		go sess.RunPowerShell(text, threadID)
+	}
 }
 
 // buildReplyContext reply qilingan xabardan kontekst yig'adi:
@@ -221,6 +228,23 @@ func (b *Bot) handleCommand(sess *Session, m *tgbotapi.Message, threadID int) {
 		b.reply(sess, threadID, "🧹 Suhbat tarixi tozalandi. Yangi sessiya boshlanadi.")
 	case "workdir":
 		b.reply(sess, threadID, "📂 <code>"+htmlEscape(b.Mgr.Workdir())+"</code>")
+	case "claude":
+		arg := strings.TrimSpace(m.CommandArguments())
+		if arg != "" {
+			// Bir martalik — mode o'zgarmaydi.
+			go sess.RunClaude(arg, threadID)
+			return
+		}
+		sess.SetMode(ModeClaude)
+		b.reply(sess, threadID, "🤖 Claude AI rejimi yoqildi. PS ga qaytish: /powershell")
+	case "powershell":
+		arg := strings.TrimSpace(m.CommandArguments())
+		if arg != "" {
+			go sess.RunPowerShell(arg, threadID)
+			return
+		}
+		sess.SetMode(ModePowerShell)
+		b.reply(sess, threadID, "🟦 PowerShell rejimi yoqildi. Claude ga o'tish: /claude")
 	default:
 		// Gruppada noma'lum komandaga javob bermaymiz (boshqa botniki bo'lishi mumkin).
 		if !(m.Chat.IsGroup() || m.Chat.IsSuperGroup()) {
@@ -284,20 +308,31 @@ func stripBotMention(text, username string) string {
 }
 
 func (b *Bot) cmdHelp(s *Session, threadID int) {
-	text := `<b>Remofy bot</b> — Claude AI agent shu kompyuterda.
+	modeLine := "🟦 <b>PowerShell</b> (default)"
+	if s.Mode() == ModeClaude {
+		modeLine = "🤖 <b>Claude AI</b>"
+	}
+	text := `<b>Remofy bot</b> — shu kompyuter uchun masofaviy terminal.
 
-Yozgan har qanday matn Claude'ga prompt sifatida yuboriladi va agent kerakli toollar (Read, Edit, Write, Bash, GitHub MCP) bilan ishlaydi.
+<b>Joriy rejim:</b> ` + modeLine + `
 
-<b>Foydalanish:</b>
-• Private chat — har qanday matn → Claude
-• Gruppa — botni @mention qiling yoki javobiga reply yozing
-• Long-running promptni <b>⏹ Stop</b> tugmasi yoki /stop bilan to'xtatish
+Free-text xabarlar joriy rejimga ko'ra ishlatiladi:
+• 🟦 PowerShell — matn shu kompyuterda PS komanda sifatida bajariladi
+• 🤖 Claude — matn Claude AI agentga prompt sifatida yuboriladi (Read, Edit, Write, Bash, GitHub MCP)
 
-<b>Komandalar:</b>
-/stop — aktiv promptni uzish
-/reset — suhbat tarixini tozalash (yangi sessiya)
-/workdir — agent ishlayotgan papka
+<b>Rejim almashtirish:</b>
+/powershell — PS rejimiga o'tish
+/claude — Claude rejimiga o'tish
+/powershell <i>komanda</i> — bir martalik PS (rejim o'zgarmaydi)
+/claude <i>savol</i> — bir martalik prompt (rejim o'zgarmaydi)
+
+<b>Boshqa komandalar:</b>
+/stop — aktiv komandani uzish
+/reset — Claude suhbat tarixini tozalash
+/workdir — ishlayotgan papka
 /help — shu yordam
+
+<b>Gruppada:</b> botni @mention qiling yoki javobiga reply yozing.
 
 <b>Workspace:</b> <code>` + htmlEscape(b.Mgr.Workdir()) + `</code>`
 
