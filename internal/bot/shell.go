@@ -7,22 +7,21 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// psEditInterval — PowerShell stream uchun message edit ticker.
-const psEditInterval = 1500 * time.Millisecond
+// shellEditInterval — shell stream uchun message edit ticker.
+const shellEditInterval = 1500 * time.Millisecond
 
-// RunPowerShell foydalanuvchi yuborgan matnni shu kompyuterda PowerShell komandasi
-// sifatida ishga tushiradi va stdout+stderr'ni Telegram xabariga edit-throttle bilan
-// strim qiladi. Sessiya `cmdSlot` va `queueGen` navbati Claude bilan birga ishlaydi —
-// shu chatda bir vaqtda faqat bitta exec bo'ladi.
-func (s *Session) RunPowerShell(command string, threadID int) {
+// RunShell foydalanuvchi yuborgan matnni shu kompyuterda platformga mos shell
+// (Windows: PowerShell, Unix: bash) komandasi sifatida ishga tushiradi va
+// stdout+stderr'ni Telegram xabariga edit-throttle bilan strim qiladi. Sessiya
+// `cmdSlot` va `queueGen` navbati Claude bilan birga ishlaydi — shu chatda bir
+// vaqtda faqat bitta exec bo'ladi.
+func (s *Session) RunShell(command string, threadID int) {
 	gen := s.CurrentQueueGen()
 
 	var queueMsgID int
@@ -70,14 +69,14 @@ func (s *Session) RunPowerShell(command string, threadID int) {
 	workdir := s.workdir
 	s.mu.Unlock()
 
-	sent, err := SendInThread(s.bot, s.ChatID, threadID, "🟦 <i>PowerShell ishlayapti…</i>", tgbotapi.ModeHTML, nil)
+	sent, err := SendInThread(s.bot, s.ChatID, threadID, "🟦 <i>"+shellLabel()+" ishlayapti…</i>", tgbotapi.ModeHTML, nil)
 	if err != nil {
-		log.Printf("ps placeholder (chat=%d, thread=%d): %v", s.ChatID, threadID, err)
+		log.Printf("shell placeholder (chat=%d, thread=%d): %v", s.ChatID, threadID, err)
 		return
 	}
 
 	// Parent — gen.ctx: /stop navbat avlodini cancel qilganda bu exec ham
-	// avtomatik o'ladi (cmd.Cancel → taskkill), claudeCancel set bo'lishini
+	// avtomatik o'ladi (cmd.Cancel → killTree), claudeCancel set bo'lishini
 	// kutmasdan. Aks holda slot-acquire bilan claudeCancel-set orasidagi
 	// oraliqda /stop bosilsa, jarayon orphan bo'lib ishlab ketardi.
 	ctx, cancel := context.WithTimeout(gen.ctx, claudeMaxWait)
@@ -94,42 +93,24 @@ func (s *Session) RunPowerShell(command string, threadID int) {
 		s.mu.Unlock()
 	}()
 
-	// Uzun komandalar uchun foydalanuvchi matnini temp UTF-8 fayldan o'qiymiz —
-	// Windows CreateProcess (~32K) command line cheklovidan oshib ketmasligi va
-	// Cyrillic/emoji aniq pass bo'lishi uchun.
-	tmpFile, err := os.CreateTemp("", "remofy-pscmd-*.ps1")
+	// Platformga mos komanda quramiz (platform_*.go): Windows'da PowerShell
+	// Invoke-Expression + temp .ps1, Unix'da bash stdin orqali.
+	cmd, cleanup, err := buildShellCmd(ctx, command)
 	if err != nil {
-		s.editPSText(sent.MessageID, "⚠️ Temp fayl xato: "+err.Error(), true)
+		s.editShellText(sent.MessageID, "⚠️ Komanda tayyorlash xato: "+err.Error(), true)
 		return
 	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmpFile.WriteString(command); err != nil {
-		tmpFile.Close()
-		s.editPSText(sent.MessageID, "⚠️ Temp fayl yozish xato: "+err.Error(), true)
-		return
-	}
-	if err := tmpFile.Close(); err != nil {
-		s.editPSText(sent.MessageID, "⚠️ Temp fayl yopish xato: "+err.Error(), true)
-		return
-	}
-
-	// Encoding'ni UTF-8 ga majburlab, foydalanuvchi komandasini script-block sifatida
-	// Invoke-Expression orqali bajaramiz. ScriptBlock — sintaksis foydalanuvchi yozgani
-	// shaklda saqlanishi uchun.
-	psCmd := "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); " +
-		"Invoke-Expression ([System.IO.File]::ReadAllText(" + psQuote(tmpPath) + ",[System.Text.Encoding]::UTF8))"
-
-	cmd := exec.CommandContext(ctx, "powershell.exe",
-		"-NoProfile", "-NoLogo", "-NonInteractive", "-Command", psCmd)
+	defer cleanup()
 	cmd.Dir = workdir
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return os.ErrProcessDone
 		}
-		return exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		killTree(cmd.Process.Pid)
+		return nil
 	}
 	cmd.WaitDelay = 5 * time.Second
+	setProcessGroup(cmd)
 
 	// stdout + stderr ni bitta pipe'ga birlashtiramiz — terminal ko'rinishi.
 	pr, pw := io.Pipe()
@@ -137,7 +118,7 @@ func (s *Session) RunPowerShell(command string, threadID int) {
 	cmd.Stderr = pw
 
 	if err := cmd.Start(); err != nil {
-		s.editPSText(sent.MessageID, "⚠️ Start xato: "+err.Error(), true)
+		s.editShellText(sent.MessageID, "⚠️ Start xato: "+err.Error(), true)
 		return
 	}
 
@@ -167,16 +148,16 @@ func (s *Session) RunPowerShell(command string, threadID int) {
 	for scanner.Scan() {
 		text.Write(scanner.Bytes())
 		text.WriteByte('\n')
-		if time.Since(lastEdit) >= psEditInterval {
+		if time.Since(lastEdit) >= shellEditInterval {
 			if cur := text.String(); cur != lastSent {
-				s.editPSText(sent.MessageID, cur, false)
+				s.editShellText(sent.MessageID, cur, false)
 				lastSent = cur
 				lastEdit = time.Now()
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		log.Printf("ps scanner (chat=%d): %v", s.ChatID, err)
+		log.Printf("shell scanner (chat=%d): %v", s.ChatID, err)
 	}
 
 	waitErr := <-waitErrCh
@@ -184,24 +165,24 @@ func (s *Session) RunPowerShell(command string, threadID int) {
 	final := strings.TrimSpace(text.String())
 	switch {
 	case ctx.Err() == context.Canceled:
-		s.editPSText(sent.MessageID, "⏹ Foydalanuvchi to'xtatdi.\n\n"+final, true)
+		s.editShellText(sent.MessageID, "⏹ Foydalanuvchi to'xtatdi.\n\n"+final, true)
 	case ctx.Err() == context.DeadlineExceeded:
-		s.editPSText(sent.MessageID, "⌛ Vaqt tugadi.\n\n"+final, true)
+		s.editShellText(sent.MessageID, "⌛ Vaqt tugadi.\n\n"+final, true)
 	case final == "" && waitErr != nil:
-		s.editPSText(sent.MessageID, "⚠️ PS xato: "+waitErr.Error(), true)
+		s.editShellText(sent.MessageID, "⚠️ "+shellLabel()+" xato: "+waitErr.Error(), true)
 	case final == "":
-		s.editPSText(sent.MessageID, "<i>(bo'sh chiqish)</i>", true)
+		s.editShellText(sent.MessageID, "<i>(bo'sh chiqish)</i>", true)
 	default:
 		body := final
 		if waitErr != nil {
 			body = final + "\n\n⚠️ exit: " + waitErr.Error()
 		}
-		s.editPSText(sent.MessageID, body, true)
+		s.editShellText(sent.MessageID, body, true)
 	}
 }
 
-// editPSText placeholder xabarni PS chiqishi bilan yangilaydi.
-func (s *Session) editPSText(msgID int, body string, final bool) {
+// editShellText placeholder xabarni shell chiqishi bilan yangilaydi.
+func (s *Session) editShellText(msgID int, body string, final bool) {
 	body = stripANSI(body)
 	body = strings.TrimRight(body, "\n")
 	if r := []rune(body); len(r) > maxMsgChars {
@@ -217,7 +198,7 @@ func (s *Session) editPSText(msgID int, body string, final bool) {
 	edit.ParseMode = tgbotapi.ModeHTML
 	if _, err := s.bot.Send(edit); err != nil {
 		if !strings.Contains(err.Error(), "not modified") {
-			log.Printf("ps edit (chat=%d): %v", s.ChatID, err)
+			log.Printf("shell edit (chat=%d): %v", s.ChatID, err)
 		}
 	}
 }

@@ -54,7 +54,7 @@ func BotCommands() []tgbotapi.BotCommand {
 	return []tgbotapi.BotCommand{
 		{Command: "start", Description: "Boshlash / yordam"},
 		{Command: "help", Description: "Yordam"},
-		{Command: "powershell", Description: "PowerShell rejimi (default)"},
+		{Command: "powershell", Description: shellLabel() + " rejimi (default)"},
 		{Command: "claude", Description: "Claude AI rejimi"},
 		{Command: "stop", Description: "Aktiv komandani to'xtatish"},
 		{Command: "reset", Description: "Suhbat tarixini tozalash"},
@@ -149,7 +149,7 @@ func (b *Bot) HandleUpdate(p Polled) {
 	case ModeClaude:
 		go sess.RunClaude(text, threadID)
 	default:
-		go sess.RunPowerShell(text, threadID)
+		go sess.RunShell(text, threadID)
 	}
 }
 
@@ -236,15 +236,15 @@ func (b *Bot) handleCommand(sess *Session, m *tgbotapi.Message, threadID int) {
 			return
 		}
 		sess.SetMode(ModeClaude)
-		b.reply(sess, threadID, "🤖 Claude AI rejimi yoqildi. PS ga qaytish: /powershell")
-	case "powershell":
+		b.reply(sess, threadID, "🤖 Claude AI rejimi yoqildi. Shell ga qaytish: /powershell")
+	case "powershell", "shell":
 		arg := strings.TrimSpace(m.CommandArguments())
 		if arg != "" {
-			go sess.RunPowerShell(arg, threadID)
+			go sess.RunShell(arg, threadID)
 			return
 		}
 		sess.SetMode(ModePowerShell)
-		b.reply(sess, threadID, "🟦 PowerShell rejimi yoqildi. Claude ga o'tish: /claude")
+		b.reply(sess, threadID, "🟦 "+shellLabel()+" rejimi yoqildi. Claude ga o'tish: /claude")
 	default:
 		// Gruppada noma'lum komandaga javob bermaymiz (boshqa botniki bo'lishi mumkin).
 		if !(m.Chat.IsGroup() || m.Chat.IsSuperGroup()) {
@@ -308,7 +308,8 @@ func stripBotMention(text, username string) string {
 }
 
 func (b *Bot) cmdHelp(s *Session, threadID int) {
-	modeLine := "🟦 <b>PowerShell</b> (default)"
+	shell := shellLabel()
+	modeLine := "🟦 <b>" + shell + "</b> (default)"
 	if s.Mode() == ModeClaude {
 		modeLine = "🤖 <b>Claude AI</b>"
 	}
@@ -317,13 +318,13 @@ func (b *Bot) cmdHelp(s *Session, threadID int) {
 <b>Joriy rejim:</b> ` + modeLine + `
 
 Free-text xabarlar joriy rejimga ko'ra ishlatiladi:
-• 🟦 PowerShell — matn shu kompyuterda PS komanda sifatida bajariladi
+• 🟦 ` + shell + ` — matn shu kompyuterda ` + shell + ` komanda sifatida bajariladi
 • 🤖 Claude — matn Claude AI agentga prompt sifatida yuboriladi (Read, Edit, Write, Bash, GitHub MCP)
 
 <b>Rejim almashtirish:</b>
-/powershell — PS rejimiga o'tish
+/powershell — ` + shell + ` rejimiga o'tish
 /claude — Claude rejimiga o'tish
-/powershell <i>komanda</i> — bir martalik PS (rejim o'zgarmaydi)
+/powershell <i>komanda</i> — bir martalik ` + shell + ` (rejim o'zgarmaydi)
 /claude <i>savol</i> — bir martalik prompt (rejim o'zgarmaydi)
 
 <b>Boshqa komandalar:</b>

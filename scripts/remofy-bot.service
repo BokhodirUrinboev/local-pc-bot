@@ -1,0 +1,26 @@
+[Unit]
+# Remofy bot — Linux systemd service (Ubuntu va boshqalar).
+# install-linux.sh shu faylni @USER@/@WORKDIR@ o'rnini to'ldirib o'rnatadi,
+# yoki qo'lda tahrirlab /etc/systemd/system/ ga nusxalashingiz mumkin.
+Description=Remofy Telegram bot (local remote terminal)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# MUHIM: Claude OAuth tokeni shu foydalanuvchining ~/.claude/ ichida bo'ladi —
+# `claude login` qaysi user ostida bajarilgan bo'lsa, shu User= bo'lishi shart.
+# SYSTEM/root EMAS (token bo'lmaydi va xavfli).
+User=@USER@
+# WorkingDirectory ichida .env bo'lishi kerak — bot uni godotenv orqali o'qiydi.
+WorkingDirectory=@INSTALL_DIR@
+ExecStart=@INSTALL_DIR@/remofy-bot
+# Windows watchdog o'rnini bosadi: crash bo'lsa qayta ko'taradi.
+Restart=always
+RestartSec=5
+# Loglar journald'ga ketadi: journalctl -u remofy-bot -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

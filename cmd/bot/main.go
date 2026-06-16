@@ -23,10 +23,9 @@ func main() {
 	}
 
 	token := mustEnv("TELEGRAM_BOT_TOKEN")
+	// BOT_WORKDIR bo'sh bo'lsa — NewManager har platformada foydalanuvchi home
+	// papkasiga tushadi (Windows: %USERPROFILE%, Unix: $HOME).
 	workdir := strings.TrimSpace(os.Getenv("BOT_WORKDIR"))
-	if workdir == "" {
-		workdir = `C:\Users\nbkab\OneDrive\Ishchi stol`
-	}
 
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
@@ -37,7 +36,6 @@ func main() {
 	// 60s — long-polling timeout (30s) ustidan xavfsiz qopla.
 	api.Client = &http.Client{Timeout: 60 * time.Second}
 	log.Printf("Bot: @%s (id=%d)", api.Self.UserName, api.Self.ID)
-	log.Printf("Workdir: %s", workdir)
 
 	allowedUsers := parseIDList(os.Getenv("ALLOWED_TELEGRAM_IDS"), "ALLOWED_TELEGRAM_IDS")
 	allowedChats := parseIDList(os.Getenv("ALLOWED_CHAT_IDS"), "ALLOWED_CHAT_IDS")
@@ -66,6 +64,7 @@ func main() {
 	}
 
 	mgr := bot.NewManager(api, workdir, systemPrompt)
+	log.Printf("Workdir: %s", mgr.Workdir())
 	b := bot.New(api, mgr, allowedUsers, allowedChats, rootCtx)
 
 	if _, err := api.Request(tgbotapi.NewSetMyCommands(bot.BotCommands()...)); err != nil {

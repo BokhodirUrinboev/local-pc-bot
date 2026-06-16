@@ -1,7 +1,10 @@
 .env
+.mcp.json
 *.exe
 bin/
 dist/
+.dist/
+/remofy-bot
 .idea/
 .vscode/
 *.log

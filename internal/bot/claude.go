@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -25,9 +24,9 @@ const (
 	claudeQueueWait = claudeMaxWait + time.Minute
 )
 
-// lookupClaudeBinary Windows'da bir nechta variantni sinab ko'radi.
+// lookupClaudeBinary platformga mos nomlarni sinab ko'radi (platform_*.go).
 func lookupClaudeBinary() (string, error) {
-	for _, name := range []string{"claude", "claude.cmd", "claude.exe", "claude.bat"} {
+	for _, name := range claudeBinaryCandidates() {
 		if p, err := exec.LookPath(name); err == nil {
 			return p, nil
 		}
@@ -153,27 +152,7 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		s.mu.Unlock()
 	}()
 
-	// Promptni temp UTF-8 faylga yozamiz: PowerShell -Command satrining
-	// Windows CreateProcess (~32K) cheklovidan oshib ketmasligi uchun. Aks holda
-	// uzun promptlarda "fork/exec ... powershell.exe: filename or extension is too long".
-	tmpFile, err := os.CreateTemp("", "remofy-prompt-*.txt")
-	if err != nil {
-		s.editClaudeText(sent.MessageID, "⚠️ Temp fayl xato: "+err.Error(), true)
-		return
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmpFile.WriteString(prompt); err != nil {
-		tmpFile.Close()
-		s.editClaudeText(sent.MessageID, "⚠️ Temp fayl yozish xato: "+err.Error(), true)
-		return
-	}
-	if err := tmpFile.Close(); err != nil {
-		s.editClaudeText(sent.MessageID, "⚠️ Temp fayl yopish xato: "+err.Error(), true)
-		return
-	}
-
-	// `-p` argumentsiz — claude promptni stdin'dan oladi (pipe orqali yuboramiz).
+	// `-p` argumentsiz — claude promptni stdin'dan oladi.
 	claudeArgs := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -192,37 +171,31 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		claudeArgs = append(claudeArgs, "--resume", sessionID)
 	}
 
-	// Claude'ni PowerShell orqali wrap qilamiz — Windows'da Go'ning to'g'ridan-to'g'ri
-	// exec'i bilan claude.exe'ga OAuth/keychain handle to'liq pass bo'lmas ekan.
-	// Temp faylni UTF-8 sifatida o'qib, claude.exe stdin'iga pipe qilamiz.
-	// $OutputEncoding/[Console]::*Encoding'ni UTF-8'ga majburlaymiz — aks holda
-	// Win-PS 5.1 default ASCII'da pipe qilib, Cyrillic/emoji '?'ga aylanadi.
-	parts := make([]string, 0, len(claudeArgs)+5)
-	parts = append(parts,
-		"$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();",
-		"[System.IO.File]::ReadAllText("+psQuote(tmpPath)+",[System.Text.Encoding]::UTF8)",
-		"|", "&", psQuote(binary))
-	for _, a := range claudeArgs {
-		parts = append(parts, psQuote(a))
+	// Platformga mos komanda quramiz (platform_*.go): Windows'da claude PowerShell
+	// orqali wrap qilinadi (OAuth/keychain handle + 32K cheklov + UTF-8), Unix'da
+	// to'g'ridan-to'g'ri exec qilinadi. Har ikkalasida prompt stdin orqali beriladi.
+	cmd, cleanup, err := buildClaudeCmd(ctx, binary, prompt, claudeArgs)
+	if err != nil {
+		s.editClaudeText(sent.MessageID, "⚠️ Komanda tayyorlash xato: "+err.Error(), true)
+		return
 	}
-	psCmd := strings.Join(parts, " ")
-
-	cmd := exec.CommandContext(ctx, "powershell.exe",
-		"-NoProfile", "-NoLogo", "-NonInteractive", "-Command", psCmd)
+	defer cleanup()
 	cmd.Dir = workdir
-	// Windows'da context cancel default holatda faqat PowerShell processni
-	// `TerminateProcess` qiladi, lekin uning farzand `claude.exe` ni qoldiradi —
-	// orphan bo'lib token sarflashda davom etadi. `taskkill /F /T` butun process
-	// daraxtini (PowerShell + claude.exe + uning child'lari) o'ldiradi.
+	// Context cancel default holatda faqat to'g'ridan-to'g'ri bolani o'ldiradi,
+	// lekin uning farzand `claude.exe`/node MCP'larini qoldiradi — orphan bo'lib
+	// token sarflaydi. killTree butun daraxtni o'ldiradi (Windows: taskkill /T,
+	// Unix: process-group SIGKILL).
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return os.ErrProcessDone
 		}
-		return exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		killTree(cmd.Process.Pid)
+		return nil
 	}
-	// Cancel'dan keyin Wait'ni cheksiz kutmaymiz — agar taskkill biror sababga
-	// ko'ra ishlamasa, 5 sek dan keyin Go o'zi forceful kill qiladi.
+	// Cancel'dan keyin Wait'ni cheksiz kutmaymiz — kill biror sababga ko'ra
+	// ishlamasa, 5 sek dan keyin Go o'zi forceful kill qiladi.
 	cmd.WaitDelay = 5 * time.Second
+	setProcessGroup(cmd)
 
 	// stdout'ni io.Pipe orqali olamiz (cmd.StdoutPipe() EMAS): cmd.Wait()'ni
 	// alohida goroutine'da chaqirib, process o'lgach pw'ni yopamiz. Shunda quyidagi
@@ -439,9 +412,4 @@ func (s *Session) editClaudeText(msgID int, body string, final bool) {
 			log.Printf("claude edit (chat=%d): %v", s.ChatID, err)
 		}
 	}
-}
-
-// psQuote PowerShell single-quote escape ('  → ”).
-func psQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }

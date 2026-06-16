@@ -3,8 +3,6 @@ package bot
 import (
 	"context"
 	"os"
-	"os/exec"
-	"strconv"
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -165,8 +163,9 @@ func (s *Session) SendInterrupt() {
 		cancel()
 	}
 	if pid > 0 {
-		// /T — butun daraxt (PowerShell + claude.exe + node MCP children).
-		_ = exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
+		// Butun daraxt (shell + claude.exe + node MCP children) — platformga mos
+		// (Windows: taskkill /T, Unix: process-group SIGKILL).
+		killTree(pid)
 	}
 	if oldGen != nil {
 		// Navbatda kutayotgan barcha goroutine'lar shu ctx.Done()'ni ko'rib bail qiladi.
