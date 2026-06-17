@@ -6,7 +6,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -20,14 +23,18 @@ type Bot struct {
 	Mgr     *Manager
 	rootCtx context.Context
 
-	allowedUsers map[int64]struct{} // user-level whitelist (private + group ichida)
-	allowedChats map[int64]struct{} // group/supergroup chat ID whitelist
+	allowedUsers  map[int64]struct{} // user-level whitelist (private + group ichida)
+	allowedChats  map[int64]struct{} // group/supergroup chat ID whitelist
+	allowAllUsers bool               // BOT_ALLOW_ALL_USERS — whitelist'ni butunlay ochadi (xavfli)
+
+	auditPath string // BOT_AUDIT_LOG — bo'sh bo'lmasa, har bir exec shu faylga yoziladi
+	auditMu   sync.Mutex
 
 	selfID       int64
 	selfUsername string
 }
 
-func New(api *tgbotapi.BotAPI, mgr *Manager, allowedUsers, allowedChats []int64, ctx context.Context) *Bot {
+func New(api *tgbotapi.BotAPI, mgr *Manager, allowedUsers, allowedChats []int64, allowAllUsers bool, auditPath string, ctx context.Context) *Bot {
 	users := make(map[int64]struct{}, len(allowedUsers))
 	for _, id := range allowedUsers {
 		users[id] = struct{}{}
@@ -37,13 +44,15 @@ func New(api *tgbotapi.BotAPI, mgr *Manager, allowedUsers, allowedChats []int64,
 		chats[id] = struct{}{}
 	}
 	return &Bot{
-		API:          api,
-		Mgr:          mgr,
-		rootCtx:      ctx,
-		allowedUsers: users,
-		allowedChats: chats,
-		selfID:       api.Self.ID,
-		selfUsername: api.Self.UserName,
+		API:           api,
+		Mgr:           mgr,
+		rootCtx:       ctx,
+		allowedUsers:  users,
+		allowedChats:  chats,
+		allowAllUsers: allowAllUsers,
+		auditPath:     auditPath,
+		selfID:        api.Self.ID,
+		selfUsername:  api.Self.UserName,
 	}
 }
 
@@ -59,6 +68,8 @@ func BotCommands() []tgbotapi.BotCommand {
 		{Command: "stop", Description: "Aktiv komandani to'xtatish"},
 		{Command: "reset", Description: "Suhbat tarixini tozalash"},
 		{Command: "workdir", Description: "Joriy ish papkasi"},
+		{Command: "cd", Description: "Ish papkasini o'zgartirish (/cd <yo'l>)"},
+		{Command: "get", Description: "Fayl yuborish (/get <yo'l>)"},
 	}
 }
 
@@ -147,8 +158,10 @@ func (b *Bot) HandleUpdate(p Polled) {
 
 	switch sess.Mode() {
 	case ModeClaude:
+		b.audit(m, "claude", text)
 		go sess.RunClaude(text, threadID)
 	default:
+		b.audit(m, "shell", text)
 		go sess.RunShell(text, threadID)
 	}
 }
@@ -227,11 +240,16 @@ func (b *Bot) handleCommand(sess *Session, m *tgbotapi.Message, threadID int) {
 		sess.Reset()
 		b.reply(sess, threadID, "🧹 Suhbat tarixi tozalandi. Yangi sessiya boshlanadi.")
 	case "workdir":
-		b.reply(sess, threadID, "📂 <code>"+htmlEscape(b.Mgr.Workdir())+"</code>")
+		b.reply(sess, threadID, "📂 <code>"+htmlEscape(sess.Cwd())+"</code>")
+	case "cd":
+		b.cmdCd(sess, m, threadID)
+	case "get":
+		b.cmdGet(sess, m, threadID)
 	case "claude":
 		arg := strings.TrimSpace(m.CommandArguments())
 		if arg != "" {
 			// Bir martalik — mode o'zgarmaydi.
+			b.audit(m, "claude", arg)
 			go sess.RunClaude(arg, threadID)
 			return
 		}
@@ -240,6 +258,7 @@ func (b *Bot) handleCommand(sess *Session, m *tgbotapi.Message, threadID int) {
 	case "powershell", "shell":
 		arg := strings.TrimSpace(m.CommandArguments())
 		if arg != "" {
+			b.audit(m, "shell", arg)
 			go sess.RunShell(arg, threadID)
 			return
 		}
@@ -254,7 +273,9 @@ func (b *Bot) handleCommand(sess *Session, m *tgbotapi.Message, threadID int) {
 }
 
 func (b *Bot) isUserAllowed(tgID int64) bool {
-	if len(b.allowedUsers) == 0 {
+	// Fail-closed: bo'sh whitelist'da bot ishga tushmaydi (main.go), shuning uchun
+	// bu yerda len==0 → ochiq mantig'i YO'Q. Faqat aniq BOT_ALLOW_ALL_USERS bilan ochiladi.
+	if b.allowAllUsers {
 		return true
 	}
 	_, ok := b.allowedUsers[tgID]
@@ -330,12 +351,14 @@ Free-text xabarlar joriy rejimga ko'ra ishlatiladi:
 <b>Boshqa komandalar:</b>
 /stop — aktiv komandani uzish
 /reset — Claude suhbat tarixini tozalash
-/workdir — ishlayotgan papka
+/workdir — joriy ish papkasi
+/cd <i>yo'l</i> — ish papkasini o'zgartirish (cd komandalar orasida saqlanadi)
+/get <i>yo'l</i> — kompyuterdan fayl yuborish
 /help — shu yordam
 
 <b>Gruppada:</b> botni @mention qiling yoki javobiga reply yozing.
 
-<b>Workspace:</b> <code>` + htmlEscape(b.Mgr.Workdir()) + `</code>`
+<b>Ish papkasi:</b> <code>` + htmlEscape(s.Cwd()) + `</code>`
 
 	// Reply keyboard faqat private chatda ko'rsatamiz — gruppada hammaga tushib ketmasin.
 	var rm interface{}
@@ -344,6 +367,63 @@ Free-text xabarlar joriy rejimga ko'ra ishlatiladi:
 	}
 	if _, err := SendInThread(b.API, s.ChatID, threadID, text, tgbotapi.ModeHTML, rm); err != nil {
 		log.Printf("cmdHelp (chat=%d): %v", s.ChatID, err)
+	}
+}
+
+// maxGetBytes — Telegram sendDocument (bot API) limiti.
+const maxGetBytes = 50 * 1024 * 1024
+
+// cmdCd shell rejimining ish papkasini o'zgartiradi (yo'l joriy cwd'ga nisbiy bo'lishi mumkin).
+// Argumentsiz — joriy papkani ko'rsatadi.
+func (b *Bot) cmdCd(sess *Session, m *tgbotapi.Message, threadID int) {
+	arg := strings.TrimSpace(m.CommandArguments())
+	if arg == "" {
+		b.reply(sess, threadID, "📂 <code>"+htmlEscape(sess.Cwd())+"</code>")
+		return
+	}
+	target := arg
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(sess.Cwd(), target)
+	}
+	target = filepath.Clean(target)
+	if st, err := os.Stat(target); err != nil || !st.IsDir() {
+		b.reply(sess, threadID, "⚠️ Papka topilmadi: <code>"+htmlEscape(arg)+"</code>")
+		return
+	}
+	sess.SetCwd(target)
+	b.reply(sess, threadID, "📂 <code>"+htmlEscape(target)+"</code>")
+}
+
+// cmdGet kompyuterdagi faylni Telegram document sifatida yuboradi (yo'l cwd'ga nisbiy bo'lishi mumkin).
+func (b *Bot) cmdGet(sess *Session, m *tgbotapi.Message, threadID int) {
+	arg := strings.TrimSpace(m.CommandArguments())
+	if arg == "" {
+		b.reply(sess, threadID, "Foydalanish: <code>/get &lt;fayl yo'li&gt;</code>")
+		return
+	}
+	path := arg
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(sess.Cwd(), path)
+	}
+	path = filepath.Clean(path)
+	st, err := os.Stat(path)
+	if err != nil {
+		b.reply(sess, threadID, "⚠️ Fayl topilmadi: <code>"+htmlEscape(arg)+"</code>")
+		return
+	}
+	if st.IsDir() {
+		b.reply(sess, threadID, "⚠️ Bu papka, fayl emas: <code>"+htmlEscape(arg)+"</code>")
+		return
+	}
+	if st.Size() > maxGetBytes {
+		b.reply(sess, threadID, fmt.Sprintf("⚠️ Fayl juda katta (%d MB). Telegram limiti — 50 MB.", st.Size()/1024/1024))
+		return
+	}
+	doc := tgbotapi.NewDocument(sess.ChatID, tgbotapi.FilePath(path))
+	doc.ReplyToMessageID = m.MessageID // topic/forum ichida to'g'ri joyga tushishi uchun
+	if _, err := b.API.Send(doc); err != nil {
+		log.Printf("get send (chat=%d, path=%s): %v", sess.ChatID, path, err)
+		b.reply(sess, threadID, "⚠️ Yuborib bo'lmadi: "+htmlEscape(err.Error()))
 	}
 }
 

@@ -27,11 +27,19 @@ func buildClaudeCmd(ctx context.Context, binary, prompt string, args []string) (
 }
 
 // buildShellCmd foydalanuvchi matnini bash'ga stdin orqali script sifatida beradi
-// (ARG_MAX cheklovidan xoli; non-interactive, stdin tty emas).
-func buildShellCmd(ctx context.Context, command string) (*exec.Cmd, func(), error) {
+// (ARG_MAX cheklovidan xoli; non-interactive, stdin tty emas). Boshlang'ich papka
+// cmd.Dir orqali; bajarilgandan keyingi $PWD cwdOutPath faylga yoziladi — shunda
+// `cd` keyingi komandaga saqlanadi.
+func buildShellCmd(ctx context.Context, command, cwdOutPath string) (*exec.Cmd, func(), error) {
+	script := command + "\nprintf '%s' \"$PWD\" > " + shQuote(cwdOutPath) + "\n"
 	cmd := exec.CommandContext(ctx, "bash")
-	cmd.Stdin = strings.NewReader(command)
+	cmd.Stdin = strings.NewReader(script)
 	return cmd, func() {}, nil
+}
+
+// shQuote wraps s in POSIX shell single quotes, escaping any embedded quote.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // setProcessGroup bolani yangi process group leader qiladi — shunda killTree

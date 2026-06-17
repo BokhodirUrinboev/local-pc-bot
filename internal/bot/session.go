@@ -28,6 +28,7 @@ type Session struct {
 
 	mu              sync.Mutex
 	mode            SessionMode        // free-text default rejimi
+	cwd             string             // shell rejimining joriy ish papkasi (/cd bilan o'zgaradi, komandalar orasida saqlanadi)
 	claudeSessionID string             // claude --resume uchun
 	claudeBinary    string             // probed yo'l (lazy)
 	claudeCancel    context.CancelFunc // aktiv exec'ni uzish (Claude yoki PS)
@@ -90,6 +91,7 @@ func (m *Manager) Get(chatID int64) *Session {
 		ChatID:       chatID,
 		bot:          m.bot,
 		workdir:      m.workdir,
+		cwd:          m.workdir,
 		systemPrompt: m.systemPrompt,
 		mode:         ModePowerShell,
 		cmdSlot:      make(chan struct{}, 1),
@@ -117,6 +119,20 @@ func (s *Session) Workdir() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.workdir
+}
+
+// Cwd shell rejimining joriy ish papkasini qaytaradi.
+func (s *Session) Cwd() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cwd
+}
+
+// SetCwd shell rejimining joriy ish papkasini o'zgartiradi.
+func (s *Session) SetCwd(dir string) {
+	s.mu.Lock()
+	s.cwd = dir
+	s.mu.Unlock()
 }
 
 // Reset Claude sessiyasini tozalaydi (--resume bekor qilinadi). Mode o'zgarmaydi.

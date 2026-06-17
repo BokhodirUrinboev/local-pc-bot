@@ -65,9 +65,7 @@ func (s *Session) RunShell(command string, threadID int) {
 		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(s.ChatID, queueMsgID))
 	}
 
-	s.mu.Lock()
-	workdir := s.workdir
-	s.mu.Unlock()
+	startDir := s.Cwd()
 
 	sent, err := SendInThread(s.bot, s.ChatID, threadID, "🟦 <i>"+shellLabel()+" ishlayapti…</i>", tgbotapi.ModeHTML, nil)
 	if err != nil {
@@ -93,15 +91,26 @@ func (s *Session) RunShell(command string, threadID int) {
 		s.mu.Unlock()
 	}()
 
+	// Komanda tugagach yangi ish papkasini (Get-Location / $PWD) shu faylga yozamiz,
+	// keyin o'qib sessiya cwd'sini yangilaymiz — `cd` keyingi komandaga saqlanadi.
+	cwdFile, err := os.CreateTemp("", "remofy-cwd-*.txt")
+	if err != nil {
+		s.editShellText(sent.MessageID, "⚠️ Temp fayl xato: "+err.Error(), true)
+		return
+	}
+	cwdPath := cwdFile.Name()
+	cwdFile.Close()
+	defer os.Remove(cwdPath)
+
 	// Platformga mos komanda quramiz (platform_*.go): Windows'da PowerShell
 	// Invoke-Expression + temp .ps1, Unix'da bash stdin orqali.
-	cmd, cleanup, err := buildShellCmd(ctx, command)
+	cmd, cleanup, err := buildShellCmd(ctx, command, cwdPath)
 	if err != nil {
 		s.editShellText(sent.MessageID, "⚠️ Komanda tayyorlash xato: "+err.Error(), true)
 		return
 	}
 	defer cleanup()
-	cmd.Dir = workdir
+	cmd.Dir = startDir
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return os.ErrProcessDone
@@ -161,6 +170,15 @@ func (s *Session) RunShell(command string, threadID int) {
 	}
 
 	waitErr := <-waitErrCh
+
+	// Yangi ish papkasini o'qib, mavjud bo'lsa sessiya cwd'sini yangilaymiz.
+	if data, e := os.ReadFile(cwdPath); e == nil {
+		if nd := strings.TrimSpace(string(data)); nd != "" {
+			if st, e2 := os.Stat(nd); e2 == nil && st.IsDir() {
+				s.SetCwd(nd)
+			}
+		}
+	}
 
 	final := strings.TrimSpace(text.String())
 	switch {

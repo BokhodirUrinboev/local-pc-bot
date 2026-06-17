@@ -27,6 +27,33 @@ func main() {
 	// papkasiga tushadi (Windows: %USERPROFILE%, Unix: $HOME).
 	workdir := strings.TrimSpace(os.Getenv("BOT_WORKDIR"))
 
+	// Konfiguratsiyani tarmoqqa chiqishdan OLDIN tekshiramiz — noto'g'ri sozlamada
+	// (ayniqsa bo'sh whitelist) Telegram'ga ulanmasdan darrov to'xtaymiz.
+	allowedUsers := parseIDList(os.Getenv("ALLOWED_TELEGRAM_IDS"), "ALLOWED_TELEGRAM_IDS")
+	allowedChats := parseIDList(os.Getenv("ALLOWED_CHAT_IDS"), "ALLOWED_CHAT_IDS")
+	allowAllUsers := envBool("BOT_ALLOW_ALL_USERS")
+	auditPath := strings.TrimSpace(os.Getenv("BOT_AUDIT_LOG"))
+
+	// Fail-closed: bo'sh whitelist bilan bu — ochiq masofaviy shell. Faqat aniq
+	// BOT_ALLOW_ALL_USERS=yes bilan ruxsat beramiz; aks holda ishga tushmaymiz.
+	switch {
+	case len(allowedUsers) > 0:
+		log.Printf("User whitelist (%d): %v", len(allowedUsers), allowedUsers)
+	case allowAllUsers:
+		log.Println("WARNING: ALLOWED_TELEGRAM_IDS bo'sh, BOT_ALLOW_ALL_USERS yoqilgan — bot HAMMA private foydalanuvchi uchun OCHIQ (xavfli)!")
+	default:
+		log.Fatal("ALLOWED_TELEGRAM_IDS bo'sh — xavfsizlik uchun bot ishga tushmaydi. " +
+			"Ruxsat etilgan Telegram ID(lar)ni kiriting, yoki (xavfli) BOT_ALLOW_ALL_USERS=yes qo'ying.")
+	}
+	if auditPath != "" {
+		log.Printf("Audit log: %s", auditPath)
+	}
+	if len(allowedChats) == 0 {
+		log.Println("INFO: ALLOWED_CHAT_IDS bo'sh — bot gruppalarda umuman javob bermaydi.")
+	} else {
+		log.Printf("Chat whitelist (%d): %v", len(allowedChats), allowedChats)
+	}
+
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		log.Fatalf("Telegram init: %v", err)
@@ -36,20 +63,6 @@ func main() {
 	// 60s — long-polling timeout (30s) ustidan xavfsiz qopla.
 	api.Client = &http.Client{Timeout: 60 * time.Second}
 	log.Printf("Bot: @%s (id=%d)", api.Self.UserName, api.Self.ID)
-
-	allowedUsers := parseIDList(os.Getenv("ALLOWED_TELEGRAM_IDS"), "ALLOWED_TELEGRAM_IDS")
-	allowedChats := parseIDList(os.Getenv("ALLOWED_CHAT_IDS"), "ALLOWED_CHAT_IDS")
-
-	if len(allowedUsers) == 0 {
-		log.Println("WARNING: ALLOWED_TELEGRAM_IDS bo'sh — bot HAMMA private foydalanuvchi uchun ochiq!")
-	} else {
-		log.Printf("User whitelist (%d): %v", len(allowedUsers), allowedUsers)
-	}
-	if len(allowedChats) == 0 {
-		log.Println("INFO: ALLOWED_CHAT_IDS bo'sh — bot gruppalarda umuman javob bermaydi.")
-	} else {
-		log.Printf("Chat whitelist (%d): %v", len(allowedChats), allowedChats)
-	}
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -65,7 +78,7 @@ func main() {
 
 	mgr := bot.NewManager(api, workdir, systemPrompt)
 	log.Printf("Workdir: %s", mgr.Workdir())
-	b := bot.New(api, mgr, allowedUsers, allowedChats, rootCtx)
+	b := bot.New(api, mgr, allowedUsers, allowedChats, allowAllUsers, auditPath, rootCtx)
 
 	if _, err := api.Request(tgbotapi.NewSetMyCommands(bot.BotCommands()...)); err != nil {
 		log.Printf("setMyCommands: %v", err)
@@ -103,6 +116,16 @@ func mustEnv(key string) string {
 		log.Fatalf("%s required", key)
 	}
 	return v
+}
+
+// envBool — "1", "true", "yes", "on" (case-insensitive) → true.
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // parseIDList vergul/probel/nuqta-vergul bilan ajratilgan int64 ID ro'yxatini parslaydi.

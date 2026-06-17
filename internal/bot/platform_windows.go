@@ -45,13 +45,17 @@ func buildClaudeCmd(ctx context.Context, binary, prompt string, args []string) (
 
 // buildShellCmd foydalanuvchi matnini temp .ps1 faylga yozib, Invoke-Expression
 // orqali bajaradi (script-block — foydalanuvchi yozgan sintaksis saqlanadi).
-func buildShellCmd(ctx context.Context, command string) (*exec.Cmd, func(), error) {
+// Boshlang'ich papka cmd.Dir orqali beriladi; bajarilgandan keyingi (Get-Location)
+// cwdOutPath faylga yoziladi (try/finally — komanda xato qilsa ham) — shunda
+// `cd` keyingi komandaga saqlanadi.
+func buildShellCmd(ctx context.Context, command, cwdOutPath string) (*exec.Cmd, func(), error) {
 	tmpPath, cleanup, err := writeTempFile(command, "remofy-pscmd-*.ps1")
 	if err != nil {
 		return nil, func() {}, err
 	}
 	psCmd := "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); " +
-		"Invoke-Expression ([System.IO.File]::ReadAllText(" + psQuote(tmpPath) + ",[System.Text.Encoding]::UTF8))"
+		"try { Invoke-Expression ([System.IO.File]::ReadAllText(" + psQuote(tmpPath) + ",[System.Text.Encoding]::UTF8)) } " +
+		"finally { [System.IO.File]::WriteAllText(" + psQuote(cwdOutPath) + ",(Get-Location).Path,[System.Text.UTF8Encoding]::new()) }"
 	cmd := exec.CommandContext(ctx, "powershell.exe",
 		"-NoProfile", "-NoLogo", "-NonInteractive", "-Command", psCmd)
 	return cmd, cleanup, nil

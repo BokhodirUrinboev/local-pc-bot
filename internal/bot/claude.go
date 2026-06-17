@@ -237,6 +237,7 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		lastSent   string
 		capturedID string
 		gotErr     string
+		seenTools  = map[string]bool{}
 	)
 
 	scanner := bufio.NewScanner(pr)
@@ -261,11 +262,32 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 				}
 			}
 		case "assistant":
+			changed := false
+			// Stream'da matn delta orqali kelmagan bo'lsa (fallback) — to'liq matnni qo'shamiz.
 			if text.Len() == 0 && ev.AssistantText != "" {
 				text.WriteString(ev.AssistantText)
-				s.editClaudeText(sent.MessageID, text.String(), false)
-				lastSent = text.String()
-				lastEdit = time.Now()
+				changed = true
+			}
+			// Tool chaqiruvlarini (Bash, Read, Edit, …) ketma-ketlikda ko'rsatamiz.
+			for _, t := range ev.Tools {
+				if t.ID != "" && seenTools[t.ID] {
+					continue
+				}
+				if t.ID != "" {
+					seenTools[t.ID] = true
+				}
+				if text.Len() > 0 {
+					text.WriteString("\n")
+				}
+				text.WriteString(toolLine(t))
+				changed = true
+			}
+			if changed {
+				if cur := text.String(); cur != lastSent {
+					s.editClaudeText(sent.MessageID, cur, false)
+					lastSent = cur
+					lastEdit = time.Now()
+				}
 			}
 		case "result":
 			if ev.IsError && ev.Result != "" {
@@ -315,6 +337,14 @@ type claudeEvent struct {
 	AssistantText string
 	Result        string
 	IsError       bool
+	Tools         []claudeTool
+}
+
+// claudeTool — assistant xabaridagi bitta tool_use bloki.
+type claudeTool struct {
+	ID   string
+	Name string
+	Arg  string
 }
 
 func parseClaudeEvent(line []byte) claudeEvent {
@@ -362,15 +392,21 @@ func parseClaudeEvent(line []byte) claudeEvent {
 	if raw.Type == "assistant" && len(raw.Message) > 0 {
 		var m struct {
 			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
+				Type  string          `json:"type"`
+				Text  string          `json:"text"`
+				ID    string          `json:"id"`
+				Name  string          `json:"name"`
+				Input json.RawMessage `json:"input"`
 			} `json:"content"`
 		}
 		if err := json.Unmarshal(raw.Message, &m); err == nil {
 			var b strings.Builder
 			for _, c := range m.Content {
-				if c.Type == "text" {
+				switch c.Type {
+				case "text":
 					b.WriteString(c.Text)
+				case "tool_use":
+					ev.Tools = append(ev.Tools, claudeTool{ID: c.ID, Name: c.Name, Arg: toolArg(c.Input)})
 				}
 			}
 			ev.AssistantText = b.String()
@@ -378,6 +414,49 @@ func parseClaudeEvent(line []byte) claudeEvent {
 	}
 
 	return ev
+}
+
+// toolArg tool_use input'idan eng foydali argumentni chiqaradi (birinchi qatori, qisqartirilgan).
+func toolArg(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var in struct {
+		Command  string `json:"command"`
+		FilePath string `json:"file_path"`
+		Path     string `json:"path"`
+		Pattern  string `json:"pattern"`
+		URL      string `json:"url"`
+		Query    string `json:"query"`
+	}
+	_ = json.Unmarshal(raw, &in)
+	for _, v := range []string{in.Command, in.FilePath, in.Path, in.Pattern, in.URL, in.Query} {
+		if v != "" {
+			v = strings.SplitN(v, "\n", 2)[0]
+			if r := []rune(v); len(r) > 120 {
+				v = string(r[:120]) + "…"
+			}
+			return v
+		}
+	}
+	return ""
+}
+
+// toolLine tool_use'ni bir qatorlik ko'rinishga aylantiradi (ikonka + nom + arg).
+func toolLine(t claudeTool) string {
+	icon := "🔧"
+	switch {
+	case t.Name == "Read" || t.Name == "Glob" || t.Name == "Grep" || t.Name == "NotebookRead":
+		icon = "📖"
+	case t.Name == "Write" || t.Name == "Edit" || t.Name == "NotebookEdit":
+		icon = "✏️"
+	case strings.HasPrefix(t.Name, "Web"):
+		icon = "🌐"
+	}
+	if t.Arg != "" {
+		return icon + " " + t.Name + ": " + t.Arg
+	}
+	return icon + " " + t.Name
 }
 
 func skipLeadingSpace(b []byte) []byte {

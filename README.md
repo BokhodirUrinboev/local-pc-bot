@@ -85,24 +85,28 @@ Boshqaruv: `systemctl status remofy-bot`, jonli loglar: `journalctl -u remofy-bo
 
 | Komanda | Tavsif |
 |---------|--------|
-| `/start`, `/help` | Yordam + joriy rejim va workdir |
-| `/powershell` | PowerShell rejimini yoqish (default) |
-| `/powershell <komanda>` | Bir martalik PS komanda (rejim o'zgarmaydi) |
+| `/start`, `/help` | Yordam + joriy rejim va ish papkasi |
+| `/powershell` (yoki `/shell`) | shell rejimini yoqish (default) |
+| `/powershell <komanda>` | Bir martalik shell komanda (rejim o'zgarmaydi) |
 | `/claude` | Claude AI rejimini yoqish |
 | `/claude <savol>` | Bir martalik prompt yuborish (rejim o'zgarmaydi) |
 | `/stop` | Aktiv komandani uzish (Ctrl+C analog) |
 | `/reset` | Claude suhbat tarixini tozalash (yangi sessiya) |
-| `/workdir` | Ishlayotgan papka |
-| (boshqa matn) | Joriy rejimga ko'ra: PS komanda yoki Claude prompt |
+| `/workdir` | Joriy ish papkasi |
+| `/cd <yo'l>` | Ish papkasini o'zgartirish (`cd` komandalar orasida saqlanadi) |
+| `/get <yo'l>` | Kompyuterdan fayl yuborish (≤50 MB) |
+| (boshqa matn) | Joriy rejimga ko'ra: shell komanda yoki Claude prompt |
 
 ## Konfiguratsiya
 
 | Env var | Tavsif |
 |---------|--------|
 | `TELEGRAM_BOT_TOKEN` | [@BotFather](https://t.me/BotFather)'dan olingan token (majburiy) |
-| `ALLOWED_TELEGRAM_IDS` | Ruxsat etilgan Telegram ID'lar (vergul bilan). Bo'sh — barcha private chatlar uchun ochiq (xavfli) |
+| `ALLOWED_TELEGRAM_IDS` | Ruxsat etilgan Telegram ID'lar (vergul bilan). **Bo'sh — bot ishga tushmaydi** (fail-closed) |
+| `BOT_ALLOW_ALL_USERS` | (xavfli) `yes` — bo'sh whitelist bilan ham ishga tushadi, hamma uchun ochiq |
 | `ALLOWED_CHAT_IDS` | Gruppa/supergroup chat ID whitelisti. Bo'sh — bot gruppalarda jim turadi (xavfsiz default) |
-| `BOT_WORKDIR` | shell va Claude ishlayotgan papka. Bo'sh — foydalanuvchi home papkasi (`%USERPROFILE%` / `$HOME`) |
+| `BOT_WORKDIR` | Boshlang'ich ish papkasi (`/cd` bilan o'zgaradi). Bo'sh — home papka (`%USERPROFILE%` / `$HOME`) |
+| `BOT_AUDIT_LOG` | (ixtiyoriy) Audit log fayli yo'li — har bir komanda/prompt yoziladi |
 | `BOT_SYSTEM_PROMPT` | Claude uchun `--append-system-prompt` (persona) |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | `.mcp.json` ichidagi GitHub MCP server uchun |
 
@@ -111,7 +115,7 @@ Boshqaruv: `systemctl status remofy-bot`, jonli loglar: `journalctl -u remofy-bo
 - **Interaktiv komandalar yo'q:** `python` REPL, `vim`, `nano` kabi stdin kutadigan dasturlar 30 daqiqada timeout bo'ladi
 - **Bitta komanda bir vaqtda:** har bir chat uchun komandalar ketma-ket bajariladi (oldingisi tugamaguncha keyingisi navbatda kutadi). `/stop` orqali aktiv'ini uzish mumkin
 - **In-memory state:** bot qayta ishga tushganda har bir chat'ning rejimi (default PS) va Claude `--resume` ID'si yo'qoladi
-- **CWD persist bo'lmaydi:** har bir shell komanda yangi processda ishlaydi (`cd` keyingi komandaga ta'sir qilmaydi). Workdir global
+- **Har bir komanda yangi process:** muhit o'zgaruvchilari (env), aliaslar va boshqa process holati komandalar orasida saqlanmaydi. Lekin ish papkasi (`cd`) saqlanadi — har chatda `/cd` orqali yoki komanda ichidagi `cd` orqali
 
 ## Arxitektura
 
@@ -119,8 +123,9 @@ Boshqaruv: `systemctl status remofy-bot`, jonli loglar: `journalctl -u remofy-bo
 remofy-bot/
 ├── cmd/bot/main.go           # Entry: env + Telegram polling
 ├── internal/bot/
-│   ├── handler.go            # Update dispatcher, whitelist, slash komandalar, mode routing
-│   ├── session.go            # Per-chat sessiya: mode, cmdSlot navbati, SendInterrupt
+│   ├── handler.go            # Update dispatcher, whitelist, slash komandalar (/cd, /get), mode routing
+│   ├── audit.go              # Har bir exec'ni log qilish (BOT_AUDIT_LOG)
+│   ├── session.go            # Per-chat sessiya: mode, cwd, cmdSlot navbati, SendInterrupt
 │   ├── claude.go             # claude -p stream-json parser + edit-throttle (OS-agnostik)
 │   ├── shell.go              # shell komanda exec + stdout/stderr stream + edit-throttle (OS-agnostik)
 │   ├── platform_windows.go   # Windows exec: powershell.exe wrapper, taskkill
